@@ -280,6 +280,14 @@ def format_raw_snapshot(kind, obj):
 def normalize_order_event(order, account_id=""):
     """Build a JSON-able order event dict from a Big QMT orderInfo object."""
     direction = _extract_direction(order)
+    remark = str(
+        _attr(
+            order,
+            ["m_strRemark", "m_strOrderRemark", "user_order_id", "order_remark", "remark"],
+            "",
+        )
+        or "",
+    )
     return {
         "event_type": EVENT_ORDER,
         "account_id": str(_attr(order, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
@@ -293,6 +301,8 @@ def normalize_order_event(order, account_id=""):
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
         "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name", "order_remark", "remark"], "") or ""),
+        "remark": remark,
+        "user_order_id": remark,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }
@@ -301,6 +311,14 @@ def normalize_order_event(order, account_id=""):
 def normalize_trade_event(trade, account_id=""):
     """Build a JSON-able trade (成交) event dict from a Big QMT dealInfo object."""
     direction = _extract_direction(trade)
+    remark = str(
+        _attr(
+            trade,
+            ["m_strRemark", "m_strOrderRemark", "user_order_id", "order_remark", "remark"],
+            "",
+        )
+        or "",
+    )
     return {
         "event_type": EVENT_TRADE,
         "account_id": str(_attr(trade, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
@@ -314,6 +332,8 @@ def normalize_trade_event(trade, account_id=""):
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(trade, ["m_nOffsetFlag", "offset_flag"]),
+        "remark": remark,
+        "user_order_id": remark,
         "traded_at": str(_attr(trade, ["m_strTradeTime", "traded_at", "trade_time"], "") or ""),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),

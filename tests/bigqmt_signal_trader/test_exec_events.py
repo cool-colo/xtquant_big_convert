@@ -31,6 +31,7 @@ class FakeDeal:
     m_nDirection = 48
     m_dTradeAmount = 1050.0
     m_dComssion = 0.5
+    m_strRemark = "O-1"
 
 
 class FakeOrder:
@@ -43,6 +44,7 @@ class FakeOrder:
     m_strOrderSysID = "O2"
     m_nDirection = 49
     m_strOptName = "s1"
+    m_strRemark = "O-1"
 
 
 class FakeRedis:
@@ -84,6 +86,8 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["action"], "BUY")  # m_nDirection 48 -> buy
         self.assertEqual(ev["traded_at"], "2026-07-02 10:00:00")
         self.assertEqual(ev["commission"], 0.5)
+        self.assertEqual(ev["remark"], "O-1")
+        self.assertEqual(ev["user_order_id"], "O-1")
 
     def test_normalize_order_event_maps_thinktrader_fields(self):
         ev = normalize_order_event(FakeOrder(), "acct")
@@ -96,6 +100,8 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["status"], 50)
         self.assertEqual(ev["action"], "SELL")  # m_nDirection 49 -> sell
         self.assertEqual(ev["strategy_name"], "s1")
+        self.assertEqual(ev["remark"], "O-1")
+        self.assertEqual(ev["user_order_id"], "O-1")
 
     def test_publish_writes_stream_and_channel(self):
         r = FakeRedis()
