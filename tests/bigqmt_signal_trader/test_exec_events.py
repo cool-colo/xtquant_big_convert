@@ -22,7 +22,8 @@ from bigqmt_signal_trader.xtquant_compat import BigQmtXtTrader, XtQuantTraderCal
 
 class FakeDeal:
     m_strAccountID = "acct"
-    m_strInstrumentID = "600000.SH"
+    m_strInstrumentID = "600000"
+    m_strExchangeID = "SH"
     m_dPrice = 10.5
     m_nVolume = 100
     m_strTradeID = "T1"
@@ -36,7 +37,8 @@ class FakeDeal:
 
 class FakeOrder:
     m_strAccountID = "acct"
-    m_strInstrumentID = "000001.SZ"
+    m_strInstrumentID = "000001"
+    m_strExchangeID = "SZ"
     m_nOrderStatus = 50
     m_nVolumeTotal = 200
     m_nVolumeTraded = 50
@@ -102,6 +104,13 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["strategy_name"], "s1")
         self.assertEqual(ev["remark"], "O-1")
         self.assertEqual(ev["user_order_id"], "O-1")
+
+    def test_normalize_trade_event_rejects_missing_exchange_for_bare_code(self):
+        class Deal:
+            m_strInstrumentID = "002479"
+
+        with self.assertRaisesRegex(ValueError, "no supported exchange ID"):
+            normalize_trade_event(Deal(), "acct")
 
     def test_publish_writes_stream_and_channel(self):
         r = FakeRedis()

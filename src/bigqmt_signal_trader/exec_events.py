@@ -79,6 +79,26 @@ def _attr(obj, names, default=None):
     return default
 
 
+def _stock_code_with_exchange(obj):
+    code = str(
+        _attr(obj, ["m_strInstrumentID", "stock_code", "m_strInstrument"], "") or "",
+    ).strip().upper()
+    if not code:
+        raise ValueError("QMT execution event is missing instrument ID")
+    if "." in code:
+        return code
+
+    exchange = str(
+        _attr(obj, ["m_strExchangeID", "exchange_id", "market"], "") or "",
+    ).strip().upper()
+    if exchange not in {"SH", "SZ", "BJ"}:
+        raise ValueError(
+            "QMT execution event has no supported exchange ID for instrument %s: %r"
+            % (code, exchange),
+        )
+    return "%s.%s" % (code, exchange)
+
+
 def _action_from_direction(direction):
     if direction in _BUY_DIRECTIONS:
         return "BUY"
@@ -291,7 +311,7 @@ def normalize_order_event(order, account_id=""):
     return {
         "event_type": EVENT_ORDER,
         "account_id": str(_attr(order, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": str(_attr(order, ["m_strInstrumentID", "stock_code", "m_strInstrument"], "") or ""),
+        "stock_code": _stock_code_with_exchange(order),
         "order_sys_id": str(_attr(order, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "order_volume": _attr(order, ["m_nVolumeTotal", "order_volume", "volume"]),
         "traded_volume": _attr(order, ["m_nVolumeTraded", "traded_volume"]),
@@ -322,7 +342,7 @@ def normalize_trade_event(trade, account_id=""):
     return {
         "event_type": EVENT_TRADE,
         "account_id": str(_attr(trade, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": str(_attr(trade, ["m_strInstrumentID", "stock_code"], "") or ""),
+        "stock_code": _stock_code_with_exchange(trade),
         "order_sys_id": str(_attr(trade, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "trade_id": str(_attr(trade, ["m_strTradeID", "trade_id"], "") or ""),
         "volume": _attr(trade, ["m_nVolume", "volume", "traded_volume"]),
