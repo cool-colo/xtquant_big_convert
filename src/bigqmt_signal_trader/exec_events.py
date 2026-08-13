@@ -79,6 +79,36 @@ def _attr(obj, names, default=None):
     return default
 
 
+def _qmt_datetime(date_val, time_val):
+    """Combine a QMT ``YYYYMMDD`` date and ``HHMMSS`` time into ``YYYY-MM-DD HH:MM:SS``.
+
+    QMT order callbacks carry ``m_strInsertDate`` / ``m_strInsertTime`` and deal
+    callbacks carry ``m_strTradeDate`` / ``m_strTradeTime`` as separate all-digit
+    strings (e.g. ``"20240222"`` + ``"091259"``). We keep the QMT-recorded date rather
+    than re-deriving it downstream (which would wrongly assume "today" for overnight or
+    post-close backfill). Returns ``""`` when either part is missing or malformed.
+    """
+    date_text = str(date_val or "").strip()
+    time_text = str(time_val or "").strip()
+    if not date_text or not time_text:
+        return ""
+    if not (date_text.isdigit() and len(date_text) == 8):
+        return ""
+    if not time_text.isdigit():
+        return ""
+    time_text = time_text.zfill(6)
+    if len(time_text) != 6:
+        return ""
+    return "%s-%s-%s %s:%s:%s" % (
+        date_text[0:4],
+        date_text[4:6],
+        date_text[6:8],
+        time_text[0:2],
+        time_text[2:4],
+        time_text[4:6],
+    )
+
+
 def _stock_code_with_exchange(obj):
     code = str(
         _attr(obj, ["m_strInstrumentID", "stock_code", "m_strInstrument"], "") or "",
@@ -323,6 +353,12 @@ def normalize_order_event(order, account_id=""):
         "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name", "order_remark", "remark"], "") or ""),
         "remark": remark,
         "user_order_id": remark,
+        # QMT-recorded委托时间 (m_strInsertDate + m_strInsertTime), so downstream can
+        # persist the venue's order time rather than the local receive clock.
+        "order_at": _qmt_datetime(
+            _attr(order, ["m_strInsertDate", "insert_date", "order_date"], ""),
+            _attr(order, ["m_strInsertTime", "insert_time", "order_time"], ""),
+        ),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }
@@ -354,7 +390,14 @@ def normalize_trade_event(trade, account_id=""):
         "offset_flag": _attr(trade, ["m_nOffsetFlag", "offset_flag"]),
         "remark": remark,
         "user_order_id": remark,
-        "traded_at": str(_attr(trade, ["m_strTradeTime", "traded_at", "trade_time"], "") or ""),
+        # QMT-recorded成交时间. Prefer the full date+time (m_strTradeDate +
+        # m_strTradeTime); fall back to a pre-normalized traded_at/trade_time string
+        # (which may be time-only) for backward compatibility.
+        "traded_at": _qmt_datetime(
+            _attr(trade, ["m_strTradeDate", "trade_date", "traded_date"], ""),
+            _attr(trade, ["m_strTradeTime", "trade_time"], ""),
+        )
+        or str(_attr(trade, ["traded_at", "trade_time", "m_strTradeTime"], "") or ""),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }

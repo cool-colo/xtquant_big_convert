@@ -1743,6 +1743,7 @@ class BigQmtXtTrader:
             order_id=order_sysid or str(item.get("user_order_id") or ""),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
+            order_at=str(item.get("order_at") or ""),
         )
 
     def _trade_from_dict(self, account_id, item):

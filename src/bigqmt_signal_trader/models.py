@@ -245,6 +245,7 @@ class OrderSnapshot:
         price=0.0,
         strategy_name="",
         remark="",
+        order_at="",
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -256,6 +257,8 @@ class OrderSnapshot:
         self.price = price
         self.strategy_name = strategy_name
         self.remark = remark
+        # QMT-recorded委托时间 ("YYYY-MM-DD HH:MM:SS"); serialized via __dict__.
+        self.order_at = order_at
 
 
 class TradeSnapshot:

@@ -6,6 +6,7 @@ The passorder signature follows src/api/qmt_jq_trade.
 import hashlib
 
 from ..code_utils import normalize_stock_code
+from ..exec_events import _qmt_datetime
 from ..models import CancelResult, OrderSnapshot, OrderSubmitResult, SignalAction, TradeSnapshot
 from .position_bigqmt import _attr, _full_code
 
@@ -141,6 +142,10 @@ class BigQmtOrderGateway:
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
                     strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "") or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
+                    order_at=_qmt_datetime(
+                        _attr(row, ("m_strInsertDate", "insert_date", "order_date"), ""),
+                        _attr(row, ("m_strInsertTime", "insert_time", "order_time"), ""),
+                    ),
                 )
             )
         return result
@@ -180,7 +185,11 @@ class BigQmtOrderGateway:
                     action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
-                    traded_at=str(_attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "") or ""),
+                    traded_at=_qmt_datetime(
+                        _attr(row, ("m_strTradeDate", "trade_date", "traded_date"), ""),
+                        _attr(row, ("m_strTradeTime", "trade_time"), ""),
+                    )
+                    or str(_attr(row, ("traded_at", "trade_time", "m_strTradeTime"), "") or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                 )
             )
