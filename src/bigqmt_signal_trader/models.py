@@ -263,7 +263,7 @@ class OrderSnapshot:
 
 class TradeSnapshot:
     def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price,
-                 traded_at="", user_order_id=""):
+                 traded_at="", user_order_id="", commission=None):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -272,6 +272,8 @@ class TradeSnapshot:
         self.price = price
         self.traded_at = traded_at
         self.user_order_id = user_order_id
+        # 手续费 (commission fee); QMT deal field m_dCommission (legacy m_dComssion/m_dComission).
+        self.commission = commission
 
 
 class OrderRef:

@@ -191,6 +191,10 @@ class BigQmtOrderGateway:
                     )
                     or str(_attr(row, ("traded_at", "trade_time", "m_strTradeTime"), "") or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
+                    commission=float(
+                        _attr(row, ("m_dCommission", "m_dComssion", "m_dComission", "commission"), 0.0)
+                        or 0.0
+                    ),
                 )
             )
         return result

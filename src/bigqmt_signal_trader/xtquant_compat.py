@@ -1762,6 +1762,7 @@ class BigQmtXtTrader:
             traded_price=_safe_float(item.get("price", item.get("traded_price"))),
             traded_at=str(item.get("traded_at") or ""),
             order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
+            commission=_safe_float(item.get("commission")),
         )
 
 
