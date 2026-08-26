@@ -150,17 +150,6 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
         self.assertIsNone(service.redis)
         self.assertEqual(service._transport.name, "zmq")
 
-    def test_order_and_trade_callbacks_forward_to_app(self):
-        strategy_module.init(FakeContext())
-        order = object()
-        trade = object()
-
-        strategy_module.on_order(FakeContext(), order)
-        strategy_module.on_trade(FakeContext(), trade)
-
-        self.assertEqual(self.app.orders, [order])
-        self.assertEqual(self.app.trades, [trade])
-
     def test_bigqmt_named_callbacks_forward_to_app(self):
         strategy_module.init(FakeContext())
         order = object()
@@ -171,6 +160,12 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
 
         self.assertEqual(self.app.orders, [order])
         self.assertEqual(self.app.trades, [trade])
+
+    def test_only_bigqmt_named_callbacks_are_exposed(self):
+        self.assertFalse(hasattr(strategy_module, "on_order"))
+        self.assertFalse(hasattr(strategy_module, "on_trade"))
+        self.assertTrue(hasattr(strategy_module, "order_callback"))
+        self.assertTrue(hasattr(strategy_module, "deal_callback"))
 
     def test_manual_sync_forwards_to_app(self):
         strategy_module.init(FakeContext())

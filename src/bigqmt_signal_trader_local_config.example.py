@@ -10,6 +10,8 @@ Do not commit the real file. It may contain account ids and Redis credentials.
 
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 
+BIGQMT_ACCOUNT_TYPE = "STOCK"
+
 BIGQMT_REDIS_CONFIG = {
     "host": "127.0.0.1",
     "port": 6379,

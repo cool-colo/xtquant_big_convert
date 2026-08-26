@@ -406,6 +406,14 @@ def _first(params, names, default=None):
     return default
 
 
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
 def _require_code(params, names):
     code = _first(params, names)
     text = str(code or "").strip()
@@ -479,8 +487,8 @@ def _weight_in_index_params(params):
 
 
 def _market_data_params(params):
-    fields = list(_first(params, ("field_list", "fields"), None) or [])
-    codes = list(_first(params, ("stock_list", "stock_code", "stockCodes"), None) or [])
+    fields = _as_list(_first(params, ("field_list", "fields"), None))
+    codes = _as_list(_first(params, ("stock_list", "stock_code", "stockCodes"), None))
     if not fields or not codes:
         raise ValueError("field_list and stock_list are required")
     dividend_type = str(params.get("dividend_type") or "none").lower()
@@ -490,6 +498,10 @@ def _market_data_params(params):
     if dividend_type not in ("", "none"):
         raise ValueError("adjusted bars (dividend_type=%s) are not served here" % dividend_type)
     period = str(params.get("period") or "1d")
+    # FormulaServer 只服务 K 线周期；tick（分笔）/L2 类周期它静默返回空——
+    # 数据明明在本地却读到 0 行（issue #66）。拒绝路由，让 RPC 桥回答。
+    if period == "tick" or period.startswith("l2"):
+        raise ValueError("period=%s is not served by FormulaServer" % period)
     count = params.get("count", -1)
     try:
         count = int(count)
@@ -534,7 +546,7 @@ def _market_data_result(raw, params):
             records.append(record)
         parsed[code] = records
 
-    requested = [str(code) for code in (_first(params, ("stock_list", "stock_code"), None) or [])]
+    requested = [str(code) for code in _as_list(_first(params, ("stock_list", "stock_code"), None))]
     for code in parsed:
         if code not in requested:
             requested.append(code)

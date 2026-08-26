@@ -16,7 +16,7 @@
   7. 写回状态。
   8. 同步持仓快照。
 - `DryRunOrderGateway`：记录委托请求，不调用真实 `passorder`。
-- `bigqmt_signal_trader_strategy.py`：大 QMT 运行文件骨架，响应 `init`、`adjust`、`on_order`、`on_trade`、`sync_positions`。
+- `bigqmt_signal_trader_strategy.py`：大 QMT 运行文件骨架，响应 `init`、`adjust`、`order_callback`、`deal_callback`、`sync_positions`。
 
 ## 当前安全状态
 

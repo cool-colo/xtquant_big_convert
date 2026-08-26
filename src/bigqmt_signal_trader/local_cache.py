@@ -23,6 +23,30 @@ def _time_col(df):
     return None
 
 
+def _time_axis(df):
+    """Return (name, use_index): where the time axis lives, or (None, False).
+
+    RPC-shaped frames keep a stime/time column; MiniQMT-shaped frames carry
+    time as the index (the client normalizer moves stime to the index and
+    drops the column). The cache must slice/dedupe by whichever exists —
+    otherwise a MiniQMT-shaped write silently disables date filtering, so
+    get_local_data returns every cached day regardless of the window
+    (issue #54 follow-up).
+    """
+    name = _time_col(df)
+    if name:
+        return name, False
+    index = getattr(df, "index", None)
+    try:
+        if index is not None and len(index):
+            digits = "".join(ch for ch in str(index[0]) if ch.isdigit())
+            if 8 <= len(digits) <= 14:
+                return "__index__", True
+    except Exception:
+        pass
+    return None, False
+
+
 def _pad_end(value):
     text = str(value)
     return text + "9" * (14 - len(text)) if 0 < len(text) < 14 else text
@@ -35,7 +59,8 @@ def _drop_placeholder_rows(df):
     for col in ("close", "open", "price", "lastPrice"):
         if col in getattr(df, "columns", []):
             try:
-                return df[df[col] != 0].reset_index(drop=True)
+                # 不 reset_index：时间轴可能在索引上（MiniQMT 形态），重置会丢掉它。
+                return df[df[col] != 0]
             except Exception:
                 return df
     return df
@@ -98,8 +123,10 @@ class LocalMarketCache:
     def _write_file(self, df, path):
         # Write in the configured format regardless of the path (the temp file ends
         # with ".tmp", not the format extension).
+        # 时间轴在索引上的帧（MiniQMT 形态）必须带索引写盘，否则读回后日期窗口失效。
+        _, on_index = _time_axis(df)
         if self.fmt == "parquet":
-            df.to_parquet(path, index=False)
+            df.to_parquet(path, index=on_index)
         else:
             df.to_pickle(path)
 
@@ -129,15 +156,27 @@ class LocalMarketCache:
         if directory and not os.path.isdir(directory):
             os.makedirs(directory, exist_ok=True)
         merged = incoming
-        tcol = _time_col(merged)
+        _, incoming_on_index = _time_axis(incoming)
         if existing:
             try:
                 old = self._read_file(existing)
-                merged = pd.concat([old, merged], ignore_index=True)
+                _, old_on_index = _time_axis(old)
+                if incoming_on_index and old_on_index:
+                    # 保留时间索引（ignore_index=True 会把 MiniQMT 形态的时间轴丢掉）。
+                    merged = pd.concat([old, merged])
+                elif incoming_on_index and not old_on_index:
+                    # 老缓存无时间轴（旧版写出），行不可切片、合并还会毁掉新数据
+                    # 的时间索引。老行丢弃——cache-through 每次都会重拉完整窗口。
+                    merged = incoming
+                else:
+                    merged = pd.concat([old, merged], ignore_index=True)
             except Exception:
                 pass
-        if tcol and tcol in merged.columns:
-            merged = merged.drop_duplicates(subset=[tcol], keep="last").sort_values(tcol).reset_index(drop=True)
+        axis, on_index = _time_axis(merged)
+        if on_index:
+            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        elif axis:
+            merged = merged.drop_duplicates(subset=[axis], keep="last").sort_values(axis).reset_index(drop=True)
         else:
             merged = merged.drop_duplicates().reset_index(drop=True)
         # Atomic-ish write (temp + replace) so a crash mid-write can't corrupt the file.
@@ -161,20 +200,25 @@ class LocalMarketCache:
             df = self._read_file(existing)
         except Exception:
             return None
-        tcol = _time_col(df)
-        if tcol and tcol in df.columns:
-            series = df[tcol].astype(str)
+        axis, on_index = _time_axis(df)
+        if axis:
+            # 每次过滤后 series 都要按当前 df 重算——上一步过滤已缩短 df，
+            # 复用旧 mask 会长度不匹配（索引形态直接报错）。
             if start_time:
+                series = df.index.astype(str) if on_index else df[axis].astype(str)
                 df = df[series >= str(start_time)]
             if end_time:
+                series = df.index.astype(str) if on_index else df[axis].astype(str)
                 df = df[series <= _pad_end(end_time)]
-            df = df.sort_values(tcol).reset_index(drop=True)
+            # 索引形态保留时间索引（MiniQMT 形态），列形态维持原 reset 行为。
+            df = df.sort_index() if on_index else df.sort_values(axis).reset_index(drop=True)
         try:
             n = int(count)
         except (TypeError, ValueError):
             n = -1
         if n > 0 and df.shape[0] > n:
-            df = df.tail(n).reset_index(drop=True)
+            # 索引形态保留时间索引；列形态维持原 reset 行为。
+            df = df.tail(n) if _time_axis(df)[1] else df.tail(n).reset_index(drop=True)
         return df
 
     def covered(self, code, period, dividend_type="none"):
@@ -182,11 +226,11 @@ class LocalMarketCache:
         df = self.read(code, period, dividend_type=dividend_type)
         if df is None or df.shape[0] == 0:
             return None
-        tcol = _time_col(df)
-        if not tcol:
+        axis, on_index = _time_axis(df)
+        if not axis:
             return (None, None, df.shape[0])
-        series = df[tcol].astype(str)
-        return (series.iloc[0], series.iloc[-1], df.shape[0])
+        series = list(df.index.astype(str)) if on_index else list(df[axis].astype(str))
+        return (series[0], series[-1], df.shape[0])
 
     def stats(self):
         """Return (files, periods) currently cached across all dividend types."""

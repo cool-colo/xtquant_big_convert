@@ -11,8 +11,6 @@ from bigqmt_signal_trader_strategy import (  # noqa: E402
     deal_callback,
     handlebar,
     init,
-    on_order,
-    on_trade,
     order_callback,
     set_account_id,
     sync_positions,

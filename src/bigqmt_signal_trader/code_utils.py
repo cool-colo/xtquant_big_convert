@@ -10,6 +10,21 @@ def normalize_stock_code(code):
     text = str(code or "").strip().upper()
     if not text:
         return ""
+    # QMT ContextInfo uses market-specific suffixes for all instrument types.
+    # If the code already has a recognized suffix, pass it through unchanged —
+    # these are native ContextInfo codes that need no normalization.
+    _QMT_SUFFIXES = (
+        ".SH", ".SZ", ".BJ", ".HK",           # Stock markets
+        ".HGT", ".SGT",                        # 港股通（沪/深）
+        ".SHO", ".SZO",                        # Options markets (8-digit codes)
+        ".SF", ".DF", ".IF", ".ZF", ".INE", ".GF",    # Futures markets
+    )
+    for suffix in _QMT_SUFFIXES:
+        if text.endswith(suffix):
+            prefix = text[:-len(suffix)]
+            if prefix and (prefix.isdigit() or prefix[0].isalpha()):
+                return text
+    # Original logic for 6-digit stock codes
     if text.startswith("SH") and _DIGIT_CODE_RE.match(text[2:]):
         return f"{text[2:]}.SH"
     if text.startswith("SZ") and _DIGIT_CODE_RE.match(text[2:]):

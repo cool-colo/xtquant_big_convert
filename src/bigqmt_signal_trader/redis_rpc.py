@@ -21,6 +21,11 @@ from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
+# time.monotonic: unaffected by wall-clock jumps, so a settle deadline
+# survives an NTP correction mid-session. Python 3.3+, fine on QMT's 3.6.
+_monotonic = time.monotonic
+
+
 RPC_REVISION = "20260715-execution-snapshot-v1"
 
 
@@ -64,6 +69,10 @@ READ_METHODS = {
     "query_execution_snapshot",
     "query_stock_position",
     "sync_positions",
+    "submit_download_history_data",
+    "submit_download_history_data2",
+    "get_download_status",
+    "wait_download",
     # 账户 / 融资融券 / 交易扩展查询（官方全局函数 + detail types）
     "query_account_infos",
     "query_account_status",
@@ -96,6 +105,15 @@ ORDER_METHODS = {
     "submit_order",
     "submit_orders_batch",
     "cancel_order",
+}
+
+# Whole-quote push subscription control methods. These drive a server-side
+# QuoteSubscriptionManager (reference-counted ContextInfo.subscribe_whole_quote)
+# rather than a market_data read; the data itself flows over the push channel.
+QUOTE_SUBSCRIPTION_METHODS = {
+    "subscribe_whole_quote",
+    "unsubscribe_whole_quote",
+    "quote_keepalive",
 }
 
 LISTENER_DEFERRED_METHODS = {
@@ -266,6 +284,7 @@ MARKET_DATA_METHODS = {
 # op — creates/updates a custom sector — but it is harmless to expose; trading
 # order writes stay gated behind ORDER_METHODS + allow_order_methods.)
 READ_METHODS |= MARKET_DATA_METHODS
+READ_METHODS |= QUOTE_SUBSCRIPTION_METHODS
 
 
 def _maybe_scalar(value):
@@ -276,6 +295,13 @@ def _maybe_scalar(value):
         except Exception:
             return value
     return value
+
+
+def _is_redis_timeout(exc):
+    name = exc.__class__.__name__.lower()
+    module = getattr(exc.__class__, "__module__", "")
+    text = str(exc).lower()
+    return ("redis" in module and "timeout" in name) or "timeout reading from socket" in text
 
 
 def to_jsonable(value):
@@ -330,6 +356,33 @@ def to_jsonable(value):
     return str(value)
 
 
+class OrderSettlement(object):
+    """One order awaiting its order_sys_id.
+
+    Why this cannot simply run on a background thread: get_trade_detail_data
+    returns EMPTY off the main strategy thread (see LISTENER_DEFERRED_METHODS),
+    so a background poll would find nothing and report every order as silently
+    rejected. The retries have to happen on the adjust thread -- just without
+    holding it.
+
+    server_error is carried here rather than on handlers._last_server_error:
+    that slot belongs to whichever request is in flight, and settling writes to
+    it long after this request left the handler (issue #43).
+    """
+
+    __slots__ = ("order_request", "result", "deadline", "attempts", "server_error",
+                 "request", "response")
+
+    def __init__(self, order_request, result, deadline):
+        self.order_request = order_request
+        self.result = result
+        self.deadline = deadline
+        self.attempts = 0
+        self.server_error = ""
+        self.request = None
+        self.response = None
+
+
 class BigQmtRpcHandlers:
     """Whitelisted RPC method handlers backed by replaceable adapters."""
 
@@ -343,6 +396,9 @@ class BigQmtRpcHandlers:
         allow_order_methods=False,
         allowed_methods=None,
         qmt_api=None,
+        settle_orders_inline=False,
+        order_settle_timeout_seconds=3.0,
+        quote_subscription_manager=None,
     ):
         self.account_id = str(account_id or "")
         self.market_data = market_data
@@ -350,10 +406,20 @@ class BigQmtRpcHandlers:
         self.order_gateway = order_gateway
         self.position_sync_sink = position_sync_sink
         self.allow_order_methods = bool(allow_order_methods)
+        self.quote_subscription_manager = quote_subscription_manager
         # QMT runtime-injected global functions (passorder/get_trade_detail_data/
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
         self._submit_journal = {}
+        # Order settlement. Async by default: blocking here holds the QMT main
+        # strategy thread, which serializes every other request behind it and
+        # caps throughput at ~2 orders/sec (issue #44).
+        self._pending_settlement = None
+        self.settle_orders_inline = bool(settle_orders_inline)
+        self.order_settle_timeout_seconds = float(order_settle_timeout_seconds)
+        # Server-side diagnostic for silent failures (e.g. passorder submitted
+        # but order not found in system). Surfaced to client via server_error.
+        self._last_server_error = ""
         if allowed_methods is None:
             allowed = set(READ_METHODS)
             if self.allow_order_methods:
@@ -379,6 +445,13 @@ class BigQmtRpcHandlers:
         requested_method = str(method or "").strip()
         method = self._canonical_method(requested_method)
         params = dict(params or {})
+        # Clear the diagnostic slot per request. It is instance state read by
+        # EVERY response (see _build_response), so without this a single failed
+        # submit_order stamps its server_error onto every later ping/query until
+        # the next order runs -- reporting a stale failure on requests that
+        # succeeded (issue #43).
+        self._last_server_error = ""
+        self._pending_settlement = None
         if not requested_method:
             raise ValueError("method is required")
         if method not in self.allowed_methods:
@@ -400,6 +473,105 @@ class BigQmtRpcHandlers:
             "rpc_revision": RPC_REVISION,
             "server_time": _dt.datetime.now(),
         }
+
+    # ------------------------------------------------------------------
+    # 全推行情订阅控制（引用计数共享 ContextInfo.subscribe_whole_quote）。
+    # 数据本身走推送通道；这里只负责订阅生命周期 + 心跳。
+    # ------------------------------------------------------------------
+
+    def _require_quote_manager(self):
+        manager = self.quote_subscription_manager
+        if manager is None:
+            raise RuntimeError("whole-quote push subscription is not configured on this server")
+        return manager
+
+    @staticmethod
+    def _quote_params(params, require_codes=False):
+        params = params or {}
+        client_id = str(params.get("client_id") or "").strip()
+        sub_id = str(params.get("sub_id") or "").strip()
+        if not client_id:
+            raise ValueError("client_id is required")
+        if not sub_id:
+            raise ValueError("sub_id is required")
+        codes = [str(c) for c in (params.get("codes") or []) if str(c or "").strip()]
+        if require_codes and not codes:
+            raise ValueError("codes is required")
+        return client_id, sub_id, codes
+
+    def _handle_subscribe_whole_quote(self, params):
+        manager = self._require_quote_manager()
+        client_id, sub_id, codes = self._quote_params(params, require_codes=True)
+        return manager.subscribe(client_id, sub_id, codes)
+
+    def _handle_unsubscribe_whole_quote(self, params):
+        manager = self._require_quote_manager()
+        client_id, sub_id, _codes = self._quote_params(params)
+        manager.unsubscribe(client_id, sub_id)
+        return {}
+
+    def _handle_quote_keepalive(self, params):
+        manager = self._require_quote_manager()
+        client_id, sub_id, _codes = self._quote_params(params)
+        manager.keepalive(client_id, sub_id)
+        return {}
+
+    def _download_job_redis(self):
+        redis_client = getattr(self, "download_job_redis_client", None)
+        if redis_client is None:
+            raise RuntimeError("download jobs require a Redis client")
+        return redis_client
+
+    def _handle_submit_download_history_data2(self, params):
+        from .download_jobs import submit_download_job
+
+        stock_list = params.get("stock_list") or params.get("stock_code") or []
+        if isinstance(stock_list, str):
+            stock_list = [stock_list]
+        return submit_download_job(
+            self._download_job_redis(),
+            self.account_id,
+            stock_list,
+            params.get("period"),
+            method="download_history_data2",
+            start_time=params.get("start_time", ""),
+            end_time=params.get("end_time", ""),
+            incrementally=params.get("incrementally"),
+            chunk_size=int(params.get("chunk_size") or getattr(self, "download_job_chunk_size", 10)),
+            job_ttl_seconds=int(params.get("job_ttl_seconds") or getattr(self, "download_job_ttl_seconds", 3600)),
+        )
+
+    def _handle_submit_download_history_data(self, params):
+        stock_code = params.get("stock_code") or params.get("code")
+        next_params = dict(params or {})
+        next_params["stock_list"] = [stock_code] if stock_code else []
+        return self._handle_submit_download_history_data2(next_params)
+
+    def _handle_get_download_status(self, params):
+        from .download_jobs import read_download_status
+
+        job_id = params.get("job_id")
+        if not job_id:
+            raise ValueError("job_id is required")
+        status = read_download_status(self._download_job_redis(), self.account_id, job_id)
+        if status is None:
+            raise KeyError("download job not found or expired: %s" % job_id)
+        return status
+
+    def _handle_wait_download(self, params):
+        from .download_jobs import wait_download_job
+
+        job_id = params.get("job_id")
+        if not job_id:
+            raise ValueError("job_id is required")
+        return wait_download_job(
+            self._download_job_redis(),
+            self.account_id,
+            job_id,
+            wait_seconds=float(params.get("wait_seconds", 600.0)),
+            poll_interval_seconds=float(params.get("poll_interval_seconds", 0.5)),
+        )
+
 
     def _handle_get_ticks(self, params):
         codes = params.get("codes")
@@ -635,6 +807,77 @@ class BigQmtRpcHandlers:
     def _handle_get_hkt_exchange_rate(self, params):
         return self._call_qmt_global("get_hkt_exchange_rate")
 
+    def _handle_download_history_data(self, params):
+        """download_history_data is a QMT global function (issue #32).
+
+        It is NOT a ContextInfo method — the adapter's _call_context path
+        always raised NotImplementedError. Now route through qmt_api (the
+        injected global), falling back to the adapter (which tries native
+        xtdata SDK then ContextInfo).
+        """
+        func = self.qmt_api.get("download_history_data")
+        # Some QMT builds only expose down_history_data (same signature, 4 args).
+        if func is None:
+            func = self.qmt_api.get("down_history_data")
+        if func is not None:
+            try:
+                stock_code = str(params.get("stock_code") or "")
+                period = str(params.get("period") or "1d")
+                start_time = str(params.get("start_time") or "")
+                end_time = str(params.get("end_time") or "")
+                result = func(stock_code, period, start_time, end_time)
+                return bool(result) if result is not None else True
+            except Exception as exc:
+                raise RuntimeError("download_history_data failed: %s" % exc)
+        # Fallback: adapter tries native xtdata SDK then ContextInfo.
+        # If the adapter lacks the method, return False (not crash).
+        try:
+            return self._handle_market_data_method("download_history_data", params)
+        except (NotImplementedError, AttributeError):
+            return False
+
+    def _handle_download_history_data2(self, params):
+        """download_history_data2 is a QMT global function (issue #32).
+
+        Native signature includes an optional callback for progress; the QMT
+        global may require it, so pass a no-op when the client didn't.
+
+        Some QMT builds expose only the single-stock download globals
+        (``download_history_data`` / ``down_history_data``) — fall back to a
+        per-code loop with those. Without this the RPC returned False and
+        nothing was downloaded, so reads only ever saw the latest day
+        (issue #54).
+        """
+        stock_list = list(params.get("stock_list") or [])
+        period = str(params.get("period") or "1d")
+        start_time = str(params.get("start_time") or "")
+        end_time = str(params.get("end_time") or "")
+        func = self.qmt_api.get("download_history_data2")
+        if func is not None:
+            try:
+                # Try with a no-op callback first (some QMT builds require it);
+                # fall back to 4-arg call if that raises TypeError.
+                try:
+                    result = func(stock_list, period, start_time, end_time, lambda data: None)
+                except TypeError:
+                    result = func(stock_list, period, start_time, end_time)
+                return bool(result) if result is not None else True
+            except Exception as exc:
+                raise RuntimeError("download_history_data2 failed: %s" % exc)
+        single = self.qmt_api.get("download_history_data") or self.qmt_api.get("down_history_data")
+        if single is not None:
+            try:
+                result = None
+                for code in stock_list:
+                    result = single(code, period, start_time, end_time)
+                return bool(result) if result is not None else True
+            except Exception as exc:
+                raise RuntimeError("download_history_data2 per-code fallback failed: %s" % exc)
+        try:
+            return self._handle_market_data_method("download_history_data2", params)
+        except (NotImplementedError, AttributeError):
+            return False
+
     def _order_action_from_params(self, params):
         action = str(params.get("action") or "").upper()
         if action:
@@ -650,8 +893,12 @@ class BigQmtRpcHandlers:
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
         price = params.get("price")
+        signal_id = str(params.get("signal_id") or "rpc-%s" % uuid.uuid4().hex)
+        order_tag = str(params.get("remark") or params.get("order_remark") or "").strip()
+        if not order_tag:
+            order_tag = "bqrpc:%s" % signal_id
         request = OrderRequest(
-            signal_id=str(params.get("signal_id") or "rpc-%s" % uuid.uuid4().hex),
+            signal_id=signal_id,
             account_id=self._request_account_id(params),
             action=self._order_action_from_params(params),
             stock_code=str(params.get("stock_code") or ""),
@@ -659,7 +906,7 @@ class BigQmtRpcHandlers:
             price=float(price if price not in (None, "") else 0),
             price_type=params.get("price_type") or "LIMIT",
             strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
-            remark=str(params.get("remark") or params.get("order_remark") or "redis_rpc"),
+            remark=order_tag,
         )
         if request.action not in ("BUY", "SELL"):
             raise ValueError("action must be BUY or SELL")
@@ -667,7 +914,111 @@ class BigQmtRpcHandlers:
             raise ValueError("stock_code is required")
         if request.volume <= 0:
             raise ValueError("volume must be positive")
-        return self.order_gateway.submit(request)
+
+        try:
+            from .exec_events import remember_order_identity
+
+            remember_order_identity(
+                getattr(self, "download_job_redis_client", None),
+                request.account_id,
+                request.remark,
+                strategy_name=request.strategy_name,
+                stock_code=request.stock_code,
+            )
+        except Exception:
+            pass
+
+        result = self.order_gateway.submit(request)
+
+        # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
+        # 系统时（静默失败），记录 server_error 让客户端知道。匹配严格按
+        # user_order_id(remark) 精确比对，不做 stock_code+action 的模糊兜底。
+        # QMT 的委托号是异步分配的（passorder 无返回值），这里按唯一
+        # user_order_id(remark) 精确匹配并回填 order_sys_id，避免客户端把
+        # 「已提交但暂无委托号」误判为下单失败（issue #38）。
+        self._last_server_error = ""
+
+        # Async callers opt out of waiting for the order id. MiniQMT's
+        # order_stock_async returns a seq immediately and delivers the id through
+        # order_callback, so holding the reply until settlement is exactly the
+        # latency the async API exists to avoid (issue #50). The order_callback
+        # push already carries order_sys_id, so nothing is lost -- only the
+        # post-submit "did it land?" check is skipped, and a silent rejection
+        # surfaces as the absence of that push rather than as server_error.
+        if not _bool_value(params.get("wait_settlement"), True):
+            return result
+
+        if self.settle_orders_inline:
+            # Opt-out: block here the way this used to. Kept only for runtimes
+            # with no adjust drain to retry on.
+            try:
+                import time as _time
+                _time.sleep(self.order_settle_timeout_seconds)
+                self._apply_order_lookup(
+                    OrderSettlement(request, result, 0.0), final=True, inline=True)
+            except Exception:
+                pass
+            return result
+        # Hand the settlement to the caller rather than raising: handle() stays
+        # a plain function for anyone driving handlers directly, and only the
+        # service defers its reply.
+        self._pending_settlement = OrderSettlement(
+            request, result, _monotonic() + self.order_settle_timeout_seconds
+        )
+        return result
+
+    def take_pending_settlement(self):
+        """Pop the settlement the last submit_order registered, if any."""
+        settlement = self._pending_settlement
+        self._pending_settlement = None
+        return settlement
+
+    def _apply_order_lookup(self, settlement, final=False, inline=False):
+        """Look the order up by remark. True when settled, False to retry.
+
+        MUST run on the main strategy thread -- get_trade_detail_data returns
+        empty anywhere else.
+        """
+        request = settlement.order_request
+        settlement.attempts += 1
+        try:
+            orders = self.order_gateway.query_orders(request.account_id, "") or []
+            by_remark = [
+                o for o in orders
+                if str(getattr(o, "user_order_id", "") or "").strip() == request.remark.strip()
+            ]
+            if by_remark:
+                sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
+                if sysid:
+                    try:
+                        settlement.result.order_sys_id = sysid
+                    except Exception:
+                        pass
+                return True
+            if not final:
+                # Not there yet. QMT assigns the id asynchronously, so an early
+                # miss is normal -- only a miss at the deadline is a real one.
+                return False
+            # Deadline reached with no remark match -> not in the system. Do NOT
+            # fall back to matching stock_code+action: order_tag is a unique id
+            # we generated, so a miss is always a real miss, while an unrelated
+            # order on the same stock and side (a manual one, or an earlier
+            # unfilled order) would silently suppress this warning and leave
+            # order_sys_id unfilled with no signal at all (issue #41).
+            message = (
+                "passorder submitted but order not found in system "
+                "(stock=%s action=%s price=%.2f volume=%d, %d lookup(s)). "
+                "QMT may have silently rejected it (check price range / permissions)."
+                % (request.stock_code, request.action, request.price,
+                   request.volume, settlement.attempts)
+            )
+            settlement.server_error = message
+            if inline:
+                self._last_server_error = message
+            return True
+        except Exception:
+            # A failed lookup must not lose the order -- it is already submitted.
+            return True
 
     def _handle_submit_orders_batch(self, params):
         orders = params.get("orders") or []
@@ -888,6 +1239,10 @@ class RedisPubSubRpcService:
         self._deferred_count = 0
         self.print_prefix = print_prefix
         self.pending = queue.Queue(maxsize=int(max_queue_size))
+        # Orders whose reply is waiting on QMT assigning an order id. Unbounded
+        # on purpose: every entry is an order that already reached the broker,
+        # so dropping one would strand a live order with no reply.
+        self._pending_settlements = queue.Queue()
         self._running = threading.Event()
         self._thread = None
         self._queue_thread = None
@@ -1031,7 +1386,20 @@ class RedisPubSubRpcService:
                 "%s deferred method=%s pending_before=%s"
                 % (self.print_prefix, payload.get("method"), self.pending.qsize())
             )
-        self.pending.put_nowait(payload)
+        try:
+            self.pending.put_nowait(payload)
+        except queue.Full:
+            # A full pending queue (client polling storm) must not raise into the
+            # adjust thread — QMT stops the strategy on a callback raise. Drop the
+            # oldest request and keep the newest instead of crashing.
+            try:
+                self.pending.get_nowait()
+            except Exception:
+                pass
+            try:
+                self.pending.put_nowait(payload)
+            except Exception:
+                pass
 
     def _should_process_in_listener(self, payload):
         if not self.process_in_listener:
@@ -1064,7 +1432,53 @@ class RedisPubSubRpcService:
             raise ValueError("rpc payload must be a json object")
         return payload
 
+    def settle_pending_orders(self, max_items=100):
+        """Retry parked order lookups. MUST be called from the adjust thread.
+
+        A queue rather than a list because rpc_listener_methods is configurable:
+        if submit_order is ever put in it, the producer becomes the listener
+        thread while this consumer stays on adjust.
+
+        Unsettled entries go back on the queue, so each order costs one lookup
+        per adjust tick until it resolves or its deadline passes.
+        """
+        settled = 0
+        # Snapshot the size first. Unsettled entries go back on the same queue,
+        # so draining until empty would keep re-picking them and spin one adjust
+        # tick into many lookups per order.
+        batch = min(int(max_items), self._pending_settlements.qsize())
+        for _ in range(batch):
+            try:
+                settlement = self._pending_settlements.get_nowait()
+            except queue.Empty:
+                break
+            expired = _monotonic() >= settlement.deadline
+            try:
+                done = self.handlers._apply_order_lookup(settlement, final=expired)
+            except Exception:
+                done = True  # never strand a submitted order in the queue
+            if not done:
+                self._pending_settlements.put(settlement)
+                continue
+            response = settlement.response
+            response["data"] = to_jsonable(settlement.result)
+            response["ok"] = True
+            if settlement.server_error:
+                response["server_error"] = settlement.server_error
+            response["handled_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                self._publish_response(settlement.request, response)
+            except Exception:
+                pass
+            settled += 1
+        return settled
+
+    def pending_settlement_count(self):
+        return self._pending_settlements.qsize()
+
     def drain_pending(self, max_items=20):
+        # Settle carry-overs from earlier ticks before taking on new work.
+        self.settle_pending_orders()
         processed = 0
         for _ in range(int(max_items)):
             try:
@@ -1078,6 +1492,10 @@ class RedisPubSubRpcService:
                 )
             self.process_request(request)
             processed += 1
+        # Settle again so an order submitted in THIS drain still replies on this
+        # tick. One lookup, no sleep -- if QMT has not assigned the id yet we
+        # simply retry next tick rather than holding the thread (issue #44).
+        self.settle_pending_orders()
         return processed
 
     def drain_request_queue(self, max_items=20):
@@ -1109,16 +1527,50 @@ class RedisPubSubRpcService:
             "ok": False,
             "data": None,
             "error": "",
+            # server_error carries QMT-side diagnostic info (e.g. passorder
+            # submitted but order not found in system, get_trade_detail_data
+            # returned empty) that doesn't raise an exception but indicates a
+            # problem. Lets clients see why an operation silently failed.
+            "server_error": "",
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
-            response["data"] = to_jsonable(self.handlers.handle(method, request.get("params") or {}))
+            result = self.handlers.handle(method, request.get("params") or {})
+            response["data"] = to_jsonable(result)
             response["ok"] = True
+            # Surface server-side diagnostics when the handler recorded one.
+            server_error = getattr(self.handlers, "_last_server_error", None)
+            if server_error:
+                response["server_error"] = str(server_error)
+            # passorder already ran, but QMT assigns the order id asynchronously.
+            # Park the reply instead of sleeping on this thread; a later adjust
+            # tick settles and publishes it (issue #44).
+            take = getattr(self.handlers, "take_pending_settlement", None)
+            settlement = take() if callable(take) else None
+            if settlement is not None:
+                settlement.request = request
+                settlement.response = response
+                self._pending_settlements.put(settlement)
+                self._deferred_count += 1
+                return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
-        self._publish_response(request, response)
+        try:
+            self._publish_response(request, response)
+        except Exception:
+            # A response-publish failure (e.g. redis outage) must not propagate
+            # to the adjust thread — QMT stops the strategy on a callback raise.
+            # The request already ran; the client will just see a timeout.
+            import traceback as _tb
+            try:
+                from .logging_setup import get_logger
+                get_logger("rpc").error(
+                    "publish response failed method=%s:\n%s", method, _tb.format_exc()
+                )
+            except Exception:
+                pass
         self._processed_count += 1
         if self._processed_count <= self.debug_log_limit:
             print("%s responded method=%s ok=%s" % (self.print_prefix, method, response["ok"]))
@@ -1230,19 +1682,34 @@ def call_redis_rpc(
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
         redis_client.rpush(request_queue, payload)
         redis_client.expire(request_queue, max(60, int(ttl_seconds)))
-        wait_timeout = max(1, int(float(timeout_seconds) + 0.999))
-        item = redis_client.blpop(response_list, timeout=wait_timeout)
-        if item:
-            raw_response = item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+        deadline = time.time() + float(timeout_seconds)
+        while True:
+            raw_response = redis_client.get(response_key)
+            if raw_response:
+                return json.loads(decode_text(raw_response))
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            wait_timeout = max(1, int(min(remaining, 1.0) + 0.999))
             try:
-                redis_client.delete(response_list)
-            except Exception:
-                pass
-            return json.loads(decode_text(raw_response))
+                item = redis_client.blpop(response_list, timeout=wait_timeout)
+            except Exception as exc:
+                if _is_redis_timeout(exc):
+                    continue
+                raise
+            if item:
+                raw_response = item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+                try:
+                    redis_client.delete(response_list)
+                except Exception:
+                    pass
+                return json.loads(decode_text(raw_response))
         raw_response = redis_client.get(response_key)
         if raw_response:
             return json.loads(decode_text(raw_response))
-        raise TimeoutError("redis rpc timeout: %s" % method)
+        raise TimeoutError(
+            "redis rpc timeout: %s account_id=%s request_queue=%s" % (method, account_id, request_queue)
+        )
 
     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
     try:

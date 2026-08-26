@@ -189,6 +189,23 @@ class ZmqTransport(RpcTransport):
             except Exception:
                 pass
             if getattr(exc, "errno", None) == zmq.EADDRINUSE:
+                # 端口被占——通常是之前策略实例没正常停止。给出友好提示和解决步骤。
+                print(
+                    "%s ZMQ_BIND_CONFLICT: 端口 %s 被占用！"
+                    % (self.print_prefix, self.bind_address)
+                )
+                print(
+                    "%s   原因：之前的 QMT 策略实例没正常停止，仍占着这个端口。"
+                    % self.print_prefix
+                )
+                print(
+                    "%s   解决：1) 在 QMT 里停止旧策略再运行；2) 或等 60s 让系统释放端口；"
+                    % self.print_prefix
+                )
+                print(
+                    "%s   3) 或改配置用别的端口（BIGQMT_REDIS_CONFIG.zmq.port）"
+                    % self.print_prefix
+                )
                 raise TransportError(
                     "ZMQ_BIND_CONFLICT address=%s; another bridge instance "
                     "already owns the configured endpoint" % self.bind_address

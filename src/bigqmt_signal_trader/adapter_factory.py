@@ -125,7 +125,7 @@ def build_app(context_info=None, config=None):
 
         qmt_api = config.get("qmt_api") or {}
         get_trade_detail_data_func = qmt_api.get("get_trade_detail_data")
-        market_data = market_data or BigQmtMarketDataProvider(context_info)
+        market_data = market_data or BigQmtMarketDataProvider(context_info, qmt_api=qmt_api)
         position_provider = position_provider or BigQmtPositionProvider(
             get_trade_detail_data_func=get_trade_detail_data_func,
             account_type=config.get("account_type", "STOCK"),

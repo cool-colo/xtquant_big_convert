@@ -158,6 +158,33 @@ class ParamTranslationTest(unittest.TestCase):
 
         self.assertEqual(client.calls[0][1]["dividendType"], "none")
 
+    def test_market_data_refuses_tick_and_l2_periods(self):
+        # issue #66: FormulaServer 不服务分笔/L2 周期——静默返回空会让调用方
+        # 以为本地没有数据（数据其实在）。拒绝路由让 RPC 桥回答。
+        router, client = self._router({"getMarketData": {"result": []}})
+
+        for period in ("tick", "l2quote", "l2order"):
+            with self.assertRaises(fs.Unroutable):
+                router.call(
+                    "get_market_data_ex",
+                    {
+                        "field_list": ["close"],
+                        "stock_list": ["000001.SZ"],
+                        "period": period,
+                        "dividend_type": "none",
+                    },
+                )
+        self.assertEqual(client.calls, [])
+
+        # K 线周期照常走快速路径
+        router.call(
+            "get_market_data_ex",
+            {"field_list": ["close"], "stock_list": ["000001.SZ"], "period": "1d",
+             "dividend_type": "none"},
+        )
+        self.assertEqual(len(client.calls), 1)
+
+
     def test_market_data_translates_flat_wire_shape(self):
         router, _ = self._router(
             {

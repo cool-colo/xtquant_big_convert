@@ -10,6 +10,8 @@ Do not commit the real file. It may contain account ids and Redis credentials.
 
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 BIGQMT_RPC_TIMEOUT_SECONDS = 6.0
+BIGQMT_DOWNLOAD_WAIT_SECONDS = 1800
+BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS = 0.5
 
 BIGQMT_REDIS_CONFIG = {
     "host": "YOUR_REDIS_HOST",
@@ -17,6 +19,19 @@ BIGQMT_REDIS_CONFIG = {
     "db": 5,
     "username": "",
     "password": "",
+    # Transport selection. Must match the QMT-side server config. Default
+    # "redis" works with the standard DRYRUN; use "zmq" when the server runs
+    # with transport=zmq (e.g. the no-redis version or explicit zmq mode).
+    "transport": "redis",
+    # ZMQ-specific settings (only used when transport=zmq):
+    # "zmq": {
+    #     # Explicit connect address. The QMT-side server binds a port derived
+    #     # from account_id (default 15563 for account 8886800503). If you know
+    #     # the exact address, set it here to skip service discovery.
+    #     "connect_address": "tcp://127.0.0.1:15563",
+    #     # "host": "127.0.0.1",
+    #     # "port": 15563,
+    # },
 }
 
 # Default direct mode calls get_full_tick through RPC. Set enabled=True only when
@@ -30,9 +45,9 @@ BIGQMT_FULL_TICK_CACHE_CONFIG = {
 }
 
 # Client-side LOCAL market-data cache.
-#   download_history_data2(codes, period, start_time, ..., callback) pulls bars
-#   over RPC once and persists them under `dir`; get_local_data(...) then reads
-#   them locally with NO RPC to Big QMT (for offline / repeated local analysis).
+#   get_market_data_ex(...) writes returned bars under `dir`; get_local_data(...)
+#   then reads them locally with NO RPC to Big QMT (for offline / repeated local
+#   analysis). download_history_data* submits a server-side Big QMT download job.
 #   - dir: cache folder (default ~/.bigqmt_cache), one pickle per (period, code).
 #   - fallback_rpc: if True, get_local_data auto-fetches+caches a cache miss;
 #     if False (default), a cache-missed code is simply omitted (download first).
@@ -66,3 +81,22 @@ BIGQMT_FORMULA_SERVER_CONFIG = {
     # "methods": [...],     # restrict routing to a subset (default: all mapped)
     # "failure_cooldown_seconds": 30.0,  # pause routing this long after a failure
 }
+
+# Whole-quote PUSH subscription (xtdata.subscribe_whole_quote, aligned with MiniQMT).
+#   Server pushes each incremental tick batch to every client subscribed to the
+#   same combination; the RPC methods above only manage the subscription lifecycle.
+#   Data flows over a separate push channel matching `transport` above
+#   (redis pub/sub, or zmq PUB/SUB when transport="zmq"), msgpack-encoded
+#   (install the `msgpack` extra; falls back to json if absent).
+#
+#   quote_client_id: process-stable subscriber id. The server counts references
+#     per (client_id, sub_id) and only tears down the shared big-QMT subscription
+#     after EVERY client of a combination unsubscribes or times out. Unset -> a
+#     persisted id is created at ~/.cache/bigqmt/quote_client_id so a restarted
+#     client is recognised as the same subscriber (needed for replay recovery).
+#   Heartbeat: client sends quote_keepalive every BIGQMT_QUOTE_HEARTBEAT_SECONDS
+#     (default 3.0). Server reaps a client after heartbeat_timeout_seconds
+#     (default 30s = 10 periods, configured server-side).
+BIGQMT_QUOTE_CLIENT_ID = None  # e.g. "my-strategy-1"; None -> persisted auto id
+# BIGQMT_QUOTE_HEARTBEAT_SECONDS = 3.0  # env var; must be < server timeout/periods
+

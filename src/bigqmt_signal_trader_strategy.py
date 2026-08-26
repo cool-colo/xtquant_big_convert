@@ -62,6 +62,8 @@ _config = {}
 _qmt_api = {}
 _adjust_logged = False
 _rpc_service = None
+_quote_subscription_service = None  # (QuoteSubscriptionManager, QuotePushChannel)
+_exec_event_redis_client = None  # reused; building a new client per trade callback leaks
 _scheduled_adjust = False
 # Latency tuning / diagnostics (server side, in the Big QMT process).
 #  - switch interval: hand the GIL to the background RPC thread ~5x more often
@@ -112,6 +114,7 @@ def bind_qmt_api(passorder_func=None, cancel_func=None, get_trade_detail_data_fu
 
 def reset_app():
     global _adjust_logged, _rpc_service, _scheduled_adjust, _last_full_tick_refresh_at, _last_full_tick_market_refresh_at
+    global _quote_subscription_service, _exec_event_redis_client
     _adjust_logged = False
     _scheduled_adjust = False
     _last_full_tick_refresh_at = 0.0
@@ -123,6 +126,28 @@ def reset_app():
         except Exception:
             pass
     _rpc_service = None
+    # Stop the quote-push channel + unsubscribe big-QMT whole-quote subs. Without
+    # this a strategy re-run leaks the PUB port (next run's start_publisher hits
+    # EADDRINUSE, silently dropping quotes forever) and leaves stale QMT
+    # subscriptions firing into dead manager objects.
+    if _quote_subscription_service is not None:
+        try:
+            manager, channel = _quote_subscription_service
+            for key in list(getattr(manager, "_combos", {}).keys()):
+                combo = manager._combos.get(key)
+                if combo is not None:
+                    try:
+                        manager._close_source(combo.handle)
+                    except Exception:
+                        pass
+            manager._combos.clear()
+            manager._sub_index.clear()
+            channel.stop()
+        except Exception:
+            pass
+    _quote_subscription_service = None
+    # Drop the reused exec-event redis client so the next run rebuilds it fresh.
+    _exec_event_redis_client = None
     _reset_runner_app()
 
 
@@ -194,6 +219,15 @@ _EXTRA_QMT_GLOBAL_FUNCS = (
     "get_option_subject_position",    # 期权标的持仓
     "get_comb_option",                # 组合期权
     "get_hkt_exchange_rate",          # 港股通汇率
+    # download_history_data / download_history_data2 are global functions
+    # injected by QMT (not ContextInfo methods), same as passorder. They
+    # must be captured here so the adapter can call them. Issue #32.
+    "download_history_data",
+    "download_history_data2",
+    # Some QMT builds expose only down_history_data (single stock, same 4-arg
+    # signature). Issue #54: without it the download RPC is a silent no-op and
+    # reads only ever return the latest day.
+    "down_history_data",
 )
 
 
@@ -202,12 +236,13 @@ def _build_config():
     if _account_id:
         config["account_id"] = _account_id
     qmt_api = dict(config.get("qmt_api") or {})
-    qmt_api.setdefault("passorder", _resolve_runtime_name("passorder"))
-    qmt_api.setdefault("cancel", _resolve_runtime_name("cancel"))
-    qmt_api.setdefault("get_trade_detail_data", _resolve_runtime_name("get_trade_detail_data"))
+    for name in ("passorder", "cancel", "get_trade_detail_data"):
+        if qmt_api.get(name) is None:
+            qmt_api[name] = _resolve_runtime_name(name)
     # 解析其余官方全局函数（存在则注入，不存在保持 None）。
     for name in _EXTRA_QMT_GLOBAL_FUNCS:
-        qmt_api.setdefault(name, _resolve_runtime_name(name))
+        if qmt_api.get(name) is None:
+            qmt_api[name] = _resolve_runtime_name(name)
     config["qmt_api"] = qmt_api
     return config
 
@@ -246,6 +281,37 @@ def _resolve_background_threads(transport_name, configured):
     if _is_redis_transport(normalized):
         return bool(configured)
     return True
+
+
+def _build_quote_subscription_service(context_info, config, transport_name, account_id, redis_client):
+    """Assemble the server-side whole-quote push service (manager + channel).
+
+    Returns ``(manager, channel)`` or ``None`` when disabled. The channel publisher
+    is started in ``_start_rpc_service`` once the RPC service is up; the manager's
+    reaper is fed from ``_drain_rpc_service``.
+    """
+    quote_config = dict(config.get("quote_push") or {})
+    enabled = _config_bool(quote_config.get("enabled"), True)
+    if not enabled:
+        return None
+    if _load_bridge_module is not None:
+        _qsm = _load_bridge_module("bigqmt_signal_trader.quote_subscription_manager")
+    else:
+        from bigqmt_signal_trader import quote_subscription_manager as _qsm
+    import importlib
+
+    _qsm = importlib.reload(_qsm)
+    heartbeat_timeout = float(quote_config.get("heartbeat_timeout_seconds", 30.0))
+    zmq_bind_address = quote_config.get("zmq_bind_address")
+    return _qsm.build_quote_subscription_service(
+        context_info,
+        transport_name=transport_name,
+        account_id=account_id,
+        redis_client=redis_client,
+        zmq_bind_address=zmq_bind_address,
+        enabled=True,
+        heartbeat_timeout_seconds=heartbeat_timeout,
+    )
 
 
 def _build_rpc_service(context_info, app, config):
@@ -300,7 +366,12 @@ def _build_rpc_service(context_info, app, config):
         redis_config = dict(config.get("redis") or {})
         redis_config.update(dict(rpc_config.get("redis") or {}))
         listen_redis_config = dict(redis_config)
-        listen_redis_config["socket_timeout"] = None
+        # Never use socket_timeout=None on the listen client: the same client also
+        # serves the adjust-thread LPOP drain, and a None timeout makes a hung
+        # (not refused) redis block the QMT main thread forever. brpop's own 1s
+        # command timeout is unaffected by a bounded socket timeout.
+        if listen_redis_config.get("socket_timeout") in (None, ""):
+            listen_redis_config["socket_timeout"] = 10
         redis_client = rpc_config.get("redis_client") or config.get("redis_client") or _redis_common.build_redis_client(listen_redis_config)
         response_redis_client = (
             rpc_config.get("response_redis_client")
@@ -312,9 +383,16 @@ def _build_rpc_service(context_info, app, config):
         print("[bigqmt_rpc] disabled: account_id is empty")
         return None
     allow_order_methods = _config_bool(rpc_config.get("allow_order_methods"), False)
+    global _quote_subscription_service
+    _quote_subscription_service = _build_quote_subscription_service(
+        context_info, config, transport_name, account_id, redis_client
+    )
+    quote_manager = (
+        _quote_subscription_service[0] if _quote_subscription_service is not None else None
+    )
     handlers = BigQmtRpcHandlers(
         account_id=account_id,
-        market_data=BigQmtMarketDataProvider(context_info),
+        market_data=BigQmtMarketDataProvider(context_info, qmt_api=qmt_api),
         position_provider=BigQmtPositionProvider(
             get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
             account_type=config.get("account_type", "STOCK"),
@@ -324,7 +402,16 @@ def _build_rpc_service(context_info, app, config):
         allow_order_methods=allow_order_methods,
         allowed_methods=rpc_config.get("allowed_methods"),
         qmt_api=qmt_api,
+        # Async settlement keeps passorder off the adjust thread's critical
+        # path; set rpc_settle_orders_inline=True only for a runtime with no
+        # adjust drain to retry on.
+        settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
+        order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
+        quote_subscription_manager=quote_manager,
     )
+    handlers.download_job_redis_client = response_redis_client or redis_client
+    handlers.download_job_chunk_size = int((config.get("download_jobs") or {}).get("chunk_size") or 10)
+    handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)
     configured_bg = _config_bool(rpc_config.get("background_threads"), False)
@@ -374,6 +461,13 @@ def _start_rpc_service(context_info, app, config):
     _rpc_service = _build_rpc_service(context_info, app, config)
     if _rpc_service is not None:
         _rpc_service.start()
+        if _quote_subscription_service is not None:
+            try:
+                _quote_subscription_service[1].start_publisher()
+                print("[bigqmt_quote_push] publisher started transport=%s"
+                      % str(dict(config.get("rpc") or {}).get("transport") or "redis"))
+            except Exception as exc:
+                _log_err("quote_push", "publisher start failed: %s" % exc)
     return _rpc_service
 
 
@@ -386,6 +480,11 @@ def _drain_rpc_service(config):
     if hasattr(_rpc_service, "drain_request_queue"):
         processed += _rpc_service.drain_request_queue(max_items=max_items)
     processed += _rpc_service.drain_pending(max_items=max_items)
+    if _quote_subscription_service is not None:
+        try:
+            _quote_subscription_service[0].reap_expired()
+        except Exception as exc:
+            _log_err("quote_push", "reap failed: %s" % exc)
     return processed
 
 
@@ -440,7 +539,7 @@ def _refresh_full_tick_cache(context_info, config):
                 max_wall_seconds=max_wall,
             )
         except Exception as exc:
-            print("[bigqmt_full_tick_cache] symbol refresh failed: %s" % exc)
+            _log_err("full_tick_cache", "symbol refresh failed: %s" % exc)
     if do_market:
         _last_full_tick_market_refresh_at = now
         try:
@@ -455,7 +554,7 @@ def _refresh_full_tick_cache(context_info, config):
                 max_wall_seconds=max_wall,
             )
         except Exception as exc:
-            print("[bigqmt_full_tick_cache] market refresh failed: %s" % exc)
+            _log_err("full_tick_cache", "market refresh failed: %s" % exc)
     return refreshed
 
 
@@ -487,6 +586,62 @@ def _schedule_adjust_if_needed(context_info, config):
         )
 
 
+# Where each adjust() call came from, and what tick_app actually costs.
+# The question this answers: handlebar is documented as tick-driven in live
+# trading, but the observed cadence is a flat ~50/10s -- exactly the run_time
+# timer and nothing else. Splitting the counters shows whether handlebar fires
+# at all once the historical replay ends, and the tick_app histogram shows what
+# it would cost to let it drive the strategy body rather than just the drain.
+_adjust_source_stats = {"handlebar": 0, "timer": 0, "window_start": 0.0}
+# Bucket upper bounds in ms; the last bucket is everything above.
+_TICK_APP_BUCKETS = (1, 5, 20, 50, 100, 250, 500, 1000, 2000)
+_tick_app_hist = [0] * (len(_TICK_APP_BUCKETS) + 1)
+_tick_app_max_ms = [0.0]
+
+
+def _record_adjust_source(source):
+    """Count adjust() calls per trigger source, logged on the cadence window."""
+    stats = _adjust_source_stats
+    now = time.time()
+    if stats["window_start"] <= 0:
+        stats["window_start"] = now
+    stats[source] = stats.get(source, 0) + 1
+    if now - stats["window_start"] >= 10.0:
+        print(
+            "[adjust_source] handlebar=%d timer=%d over %.0fs"
+            % (stats["handlebar"], stats["timer"], now - stats["window_start"])
+        )
+        stats.update({"handlebar": 0, "timer": 0, "window_start": now})
+
+
+def _record_tick_app_ms(ms):
+    """Histogram of tick_app cost.
+
+    tick_app is the expensive half of adjust() and is skipped while
+    is_last_bar() is False, so the replay-time cost (~0.2ms/call) says nothing
+    about what it costs at the live edge. Before letting ticks drive it we need
+    the real distribution, not just the >50ms outliers the phase logger prints.
+    """
+    for index, bound in enumerate(_TICK_APP_BUCKETS):
+        if ms <= bound:
+            _tick_app_hist[index] += 1
+            break
+    else:
+        _tick_app_hist[-1] += 1
+    if ms > _tick_app_max_ms[0]:
+        _tick_app_max_ms[0] = ms
+
+
+def _format_tick_app_hist():
+    labels = []
+    previous = 0
+    for index, bound in enumerate(_TICK_APP_BUCKETS):
+        labels.append("%d-%dms=%d" % (previous, bound, _tick_app_hist[index]))
+        previous = bound
+    labels.append(">%dms=%d" % (_TICK_APP_BUCKETS[-1], _tick_app_hist[-1]))
+    return " ".join(labels)
+
+
 def _record_adjust_tick():
     """Track and periodically log the real interval between adjust triggers."""
     stats = _adjust_tick_stats
@@ -507,6 +662,9 @@ def _record_adjust_tick():
             "[bigqmt_signal_trader] adjust cadence: ticks=%d avg=%.3fs min=%.3fs max=%.3fs over %.0fs"
             % (stats["count"], avg, stats["min"], stats["max"], now - stats["window_start"])
         )
+        if sum(_tick_app_hist) > 0:
+            print("[tick_app_hist] %s max=%.0fms"
+                  % (_format_tick_app_hist(), _tick_app_max_ms[0]))
         stats.update({"count": 0, "sum": 0.0, "min": 0.0, "max": 0.0, "window_start": now})
 
 
@@ -564,16 +722,148 @@ def init(ContextInfo):
     if detected_account_id and not _account_id:
         set_account_id(detected_account_id)
     if _account_id and hasattr(ContextInfo, "set_account"):
-        ContextInfo.set_account(_account_id)
+        try:
+            ContextInfo.set_account(_account_id)
+        except Exception as exc:
+            _log_startup_error("set_account failed: %s" % exc)
     _apply_gil_tuning()
     _start_latency_probe()
     config = _build_config()
     runtime = BigQmtRuntimeAdapter(ContextInfo)
-    app = init_app(runtime, _build_app)
-    _start_rpc_service(ContextInfo, app, config)
-    _schedule_adjust_if_needed(ContextInfo, config)
+    app = None
+    try:
+        app = init_app(runtime, _build_app)
+    except Exception as exc:
+        # A build failure (e.g. missing redis package) must not kill the strategy
+        # before the RPC service even starts — log it and continue without app.
+        _log_startup_error("init_app/build_app failed: %s" % exc)
+    try:
+        _start_rpc_service(ContextInfo, app, config)
+    except Exception as exc:
+        # e.g. zmq port conflict -> TransportError. Log it so the user sees why
+        # the RPC service didn't start instead of QMT silently exiting.
+        _log_startup_error("rpc service start failed: %s" % exc)
+    try:
+        _schedule_adjust_if_needed(ContextInfo, config)
+    except Exception as exc:
+        _log_startup_error("schedule adjust failed: %s" % exc)
     print("[bigqmt_signal_trader] init ok")
+
+    # 启动时自动诊断：检测服务状态 + 关键函数绑定，方便发现问题
+    _diag_startup(ContextInfo, config)
     return app
+
+
+def _log_startup_error(message):
+    """Log a startup error to file AND the QMT panel; never raises."""
+    try:
+        from bigqmt_signal_trader.logging_setup import get_logger
+        get_logger("init").error("%s", message)
+    except Exception:
+        pass
+    try:
+        print("[bigqmt_signal_trader] INIT ERROR: %s" % message)
+    except Exception:
+        pass
+
+
+def _log_err(tag, message):
+    """Log a runtime error to the rotating file AND the QMT panel; never raises.
+
+    Centralizes error visibility: the QMT output panel scrolls away, but the
+    log file (logs/bigqmt.log, kept 7 days) survives restarts and crashes.
+    """
+    try:
+        from bigqmt_signal_trader.logging_setup import get_logger
+        get_logger(tag).error("%s", message)
+    except Exception:
+        pass
+    try:
+        print("[bigqmt_signal_trader] %s: %s" % (tag, message))
+    except Exception:
+        pass
+
+
+def _diag_bar_driver(context_info):
+    """Report what drives handlebar: the strategy's own symbol, period, and
+    whether any quote subscription exists.
+
+    handlebar is documented as firing per incoming tick in live trading, but it
+    goes quiet here once the historical replay ends. This strategy never calls
+    subscribe_quote / subscribe_whole_quote / set_universe, so the leading
+    suspect is that nothing is feeding it ticks. Print what QMT actually has so
+    the next live session settles it instead of us guessing.
+    """
+    fields = (
+        ("stockcode", "品种"),
+        ("stock_code", "品种(alt)"),
+        ("period", "周期"),
+        ("do_back_test", "回测模式"),
+        ("start", "起始"),
+        ("end", "结束"),
+    )
+    parts = []
+    for name, label in fields:
+        try:
+            value = getattr(context_info, name, None)
+            if callable(value):
+                value = value()
+            if value not in (None, ""):
+                parts.append("%s=%s" % (label, value))
+        except Exception:
+            continue
+    print("[bigqmt_diag] bar driver: %s" % (" ".join(parts) or "<无法读取>"))
+
+    for name in ("subscribe_quote", "subscribe_whole_quote", "set_universe", "is_last_bar"):
+        print("[bigqmt_diag]   %-22s %s"
+              % (name, "可用" if callable(getattr(context_info, name, None)) else "不可用"))
+    try:
+        print("[bigqmt_diag]   is_last_bar() 当前值    %s" % context_info.is_last_bar())
+    except Exception as exc:
+        print("[bigqmt_diag]   is_last_bar() 调用失败  %s" % exc)
+    print("[bigqmt_diag]   本策略未订阅任何行情 -> handlebar 预计仅由历史回放驱动")
+
+
+def _diag_startup(ContextInfo, config):
+    """Startup diagnostics: check service status and key function bindings.
+
+    Prints a summary to the QMT log so users can quickly see if the RPC service
+    is up, which transport is active, and whether key QMT functions (passorder,
+    get_trade_detail_data) are bound. Helps diagnose "service won't start" issues.
+    """
+    print("=" * 60)
+    print("[bigqmt_diag] startup diagnostics")
+    print("=" * 60)
+
+    _diag_bar_driver(ContextInfo)
+
+    # 1. RPC service status
+    rpc_config = dict(config.get("rpc") or {})
+    transport = rpc_config.get("transport", "redis")
+    print("[bigqmt_diag] transport=%s" % transport)
+    if _rpc_service is not None:
+        print("[bigqmt_diag] rpc_service=running (type=%s)" % type(_rpc_service).__name__)
+    else:
+        print("[bigqmt_diag] rpc_service=NOT STARTED (check enable_rpc / errors above)")
+
+    # 2. Key QMT function bindings
+    qmt_api = dict(config.get("qmt_api") or {})
+    for name in ("passorder", "cancel", "get_trade_detail_data", "down_history_data"):
+        bound = qmt_api.get(name) is not None
+        print("[bigqmt_diag] %s bound=%s" % (name, bound))
+
+    # 3. Quick connectivity test (get_full_tick)
+    try:
+        tick = ContextInfo.get_full_tick(["000001.SZ"])
+        if tick:
+            print("[bigqmt_diag] get_full_tick=OK (keys=%d)" % len(tick))
+        else:
+            print("[bigqmt_diag] get_full_tick=EMPTY (market may be closed)")
+    except Exception as e:
+        print("[bigqmt_diag] get_full_tick=FAIL: %s" % str(e)[:60])
+
+    print("[bigqmt_diag] diagnostics complete")
+    print("=" * 60)
 
 
 def _pump_download_jobs(context_info, config):
@@ -596,7 +886,7 @@ def _pump_download_jobs(context_info, config):
     if market_data is None:
         from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 
-        market_data = BigQmtMarketDataProvider(context_info)
+        market_data = BigQmtMarketDataProvider(context_info, qmt_api=dict(config.get("qmt_api") or {}))
     try:
         from bigqmt_signal_trader.download_jobs import pump_download_jobs
 
@@ -609,41 +899,104 @@ def _pump_download_jobs(context_info, config):
             job_ttl_seconds=int(job_config.get("job_ttl_seconds") or 3600),
         )
     except Exception as exc:
-        print("[bigqmt_download_jobs] pump failed: %s" % exc)
+        _log_err("download_jobs", "pump failed: %s" % exc)
         return None
 
 
 def _adjust_phase(name, fn, *args):
     """Time one adjust phase; log only if it exceeds 50ms. Pinpoints which part of
     the 500ms adjust cycle holds the GIL (the gil_probe shows the stall exists;
-    this shows WHERE). The finally-log never alters the call's result/exception."""
+    this shows WHERE). The finally-log never alters the call's result/exception.
+
+    Guard with except: an exception here (e.g. redis outage inside the LPOP
+    drain) must NOT propagate into adjust/handlebar — QMT stops the strategy on
+    a callback raise, which is the 'auto-exit' users report. Log and continue.
+    """
     t0 = time.perf_counter()
     try:
         return fn(*args)
+    except Exception:
+        import traceback as _tb
+        try:
+            from bigqmt_signal_trader.logging_setup import get_logger
+            get_logger("adjust").error("adjust phase %s failed:\n%s", name, _tb.format_exc())
+        except Exception:
+            pass
+        return None
     finally:
         ms = (time.perf_counter() - t0) * 1000.0
         if ms > 50.0:
             print("[adjust_phase] %s %.0fms" % (name, ms))
 
 
-def adjust(ContextInfo):
+def adjust(ContextInfo, _source="timer"):
     global _adjust_logged
     _record_adjust_tick()
+    _record_adjust_source(_source)
     config = _build_config()
     _adjust_phase("drain", _drain_rpc_service, config)
     _adjust_phase("full_tick", _refresh_full_tick_cache, ContextInfo, config)
     _adjust_phase("download", _pump_download_jobs, ContextInfo, config)
-    if hasattr(ContextInfo, "is_last_bar") and not ContextInfo.is_last_bar():
-        return None
+    try:
+        if hasattr(ContextInfo, "is_last_bar") and not ContextInfo.is_last_bar():
+            return None
+    except Exception:
+        pass
     if not _adjust_logged:
         print("[bigqmt_signal_trader] adjust ok")
         _adjust_logged = True
-    return _adjust_phase("tick_app", tick_app, ContextInfo, datetime.datetime.now())
+    _tick_app_t0 = time.perf_counter()
+    try:
+        return _adjust_phase("tick_app", tick_app, ContextInfo, datetime.datetime.now())
+    finally:
+        # Every call, not just the >50ms ones _adjust_phase prints: deciding
+        # whether ticks may drive this needs the whole distribution.
+        _record_tick_app_ms((time.perf_counter() - _tick_app_t0) * 1000.0)
 
 
 def handlebar(ContextInfo):
-    """Standard Big QMT bar callback."""
-    return adjust(ContextInfo)
+    """Standard Big QMT bar callback.
+
+    Documented as tick-driven during live trading ("再在每个tick数据来后驱动运行
+    一次"), but the observed cadence is a flat ~50/10s -- the run_time timer
+    alone. Tagging the source tells us whether this ever fires once the
+    historical replay ends; the strategy subscribes to no quote, which is the
+    leading suspect.
+    """
+    return adjust(ContextInfo, _source="handlebar")
+
+
+def _exec_event_redis(config):
+    """Return a redis client for exec-event publishing, reusing one instance.
+
+    Previously a new client was built per order/trade callback when the RPC
+    service had none (the zmq-transport case), leaking a connection pool per
+    event. Reuse one; build failure returns None so publishing just skips.
+    """
+    global _exec_event_redis_client
+    existing = getattr(_rpc_service, "redis", None) if _rpc_service is not None else None
+    if existing is not None:
+        return existing
+    if _exec_event_redis_client is not None:
+        return _exec_event_redis_client
+    redis_config = dict(config.get("redis") or {})
+    if not redis_config:
+        return None
+    try:
+        from bigqmt_signal_trader.adapters.redis_common import build_redis_client
+
+        _exec_event_redis_client = build_redis_client(redis_config)
+    except Exception as exc:
+        # 静默 None 会让事件悄悄全丢（issue #71 的 protocol 崩溃就是这样没的），
+        # 必须留痕。
+        try:
+            from bigqmt_signal_trader.logging_setup import get_logger
+
+            get_logger("strategy").error("exec-event redis client build failed: %s", exc)
+        except Exception:
+            pass
+        return None
+    return _exec_event_redis_client
 
 
 def _publish_exec_event(kind, obj):
@@ -667,14 +1020,9 @@ def _publish_exec_event(kind, obj):
     account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return
-    redis_client = getattr(_rpc_service, "redis", None)
+    redis_client = _exec_event_redis(config)
     if redis_client is None:
-        redis_config = dict(config.get("redis") or {})
-        if not redis_config:
-            return
-        from bigqmt_signal_trader.adapters.redis_common import build_redis_client
-
-        redis_client = build_redis_client(redis_config)
+        return
     try:
         from bigqmt_signal_trader import exec_events
 
@@ -685,31 +1033,35 @@ def _publish_exec_event(kind, obj):
             exec_events.publish_trade_event(redis_client, account_id, event)
         else:
             event = exec_events.normalize_order_event(obj, account_id)
+            event = exec_events.enrich_order_identity(redis_client, account_id, event)
             if raw_fields:
                 event["raw_fields"] = raw_fields
             exec_events.publish_order_event(redis_client, account_id, event)
+            # 废单 (status=57 ENTRUST_STATUS_JUNK) 推送 order_error，让客户端
+            # on_order_error 能感知下单被拒。
+            try:
+                status = int(event.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status == 57:
+                err_event = exec_events.normalize_order_error_event(obj, account_id)
+                if raw_fields:
+                    err_event["raw_fields"] = raw_fields
+                exec_events.publish_order_error_event(redis_client, account_id, err_event)
     except Exception as exc:
-        print("[bigqmt_exec_events] publish %s failed: %s" % (kind, exc))
-
-
-def on_order(ContextInfo, order):
-    _publish_exec_event("order", order)
-    return forward_order_event(BigQmtRuntimeAdapter.to_order_event(order))
-
-
-def on_trade(ContextInfo, trade):
-    _publish_exec_event("trade", trade)
-    return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(trade))
+        _log_err("exec_events", "publish %s failed: %s" % (kind, exc))
 
 
 def order_callback(ContextInfo, orderInfo):
     """Standard Big QMT order callback."""
-    return on_order(ContextInfo, orderInfo)
+    _publish_exec_event("order", orderInfo)
+    return forward_order_event(BigQmtRuntimeAdapter.to_order_event(orderInfo))
 
 
 def deal_callback(ContextInfo, dealInfo):
     """Standard Big QMT deal callback."""
-    return on_trade(ContextInfo, dealInfo)
+    _publish_exec_event("trade", dealInfo)
+    return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(dealInfo))
 
 
 def sync_positions(ContextInfo):

@@ -4,20 +4,49 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xtquant-big-convert"
-version = "0.1.0"
-description = "Big QMT Redis RPC bridge and MiniQMT-compatible adapter layer"
+version = "0.2.9"
+description = "Big QMT RPC bridge and MiniQMT-compatible adapter layer (redis/zmq/mysql transports)"
+readme = "README.md"
 requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "litaolemo"},
+]
+keywords = ["qmt", "quant", "trading", "rpc", "redis", "zmq", "bigqmt", "miniqmt"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
 dependencies = [
     "pyzmq>=25.0.0",
 ]
 
 [project.optional-dependencies]
 redis = ["redis>=5.0.0"]
-dev = []
+mysql = ["pymysql>=1.0.0", "DBUtils>=3.0.0"]
+# Faster/smaller wire encoding for whole-quote push (falls back to json if absent).
+msgpack = ["msgpack>=1.0.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/litaolemo/xtquant_big_convert"
+Repository = "https://github.com/litaolemo/xtquant_big_convert.git"
+Issues = "https://github.com/litaolemo/xtquant_big_convert/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
+    "BIGQMT_REDIS_DRYRUN",
     "BIGQMT_ZMQ_BACKTEST",
     "bigqmt_signal_trader_strategy",
     "bigqmt_signal_trader_redis_rpc_runtime",
@@ -28,3 +57,7 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["bigqmt_signal_trader*", "bigqmt_backtest*", "xtquant*"]
+
+[tool.setuptools.package-data]
+bigqmt_signal_trader = ["*.md"]

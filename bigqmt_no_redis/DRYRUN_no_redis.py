@@ -230,10 +230,11 @@ try:
         "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
         "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
         "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate",
+        "get_hkt_exchange_rate", "down_history_data",
     ):
         if function_name in globals():
             qmt_extra[function_name] = globals()[function_name]
+    print("[bigqmt_shell] down_history_data bound=%s" % ("down_history_data" in qmt_extra))
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
         cancel_func=globals().get("cancel"),

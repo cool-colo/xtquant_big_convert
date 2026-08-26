@@ -20,9 +20,14 @@ import time
 
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
 TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
+ORDER_ERROR_CHANNEL_TEMPLATE = "bigqmt:order_error_events:{account_id}"
+CANCEL_ERROR_CHANNEL_TEMPLATE = "bigqmt:cancel_error_events:{account_id}"
+ORDER_IDENTITY_KEY_TEMPLATE = "bigqmt:order_identity:{account_id}:{user_order_id}"
 
 EVENT_ORDER = "order"
 EVENT_TRADE = "trade"
+EVENT_ORDER_ERROR = "order_error"
+EVENT_CANCEL_ERROR = "cancel_error"
 
 # ThinkTrader enum_EEntrustBS (买卖方向, the m_nDirection field), universal across
 # 股票/期货/期权. Ref: https://dict.thinktrader.net/innerApi/enum_constants.html
@@ -67,6 +72,21 @@ def trade_channel(account_id):
     return TRADE_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
 
 
+def order_error_channel(account_id):
+    return ORDER_ERROR_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
+
+
+def cancel_error_channel(account_id):
+    return CANCEL_ERROR_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
+
+
+def order_identity_key(account_id, user_order_id):
+    return ORDER_IDENTITY_KEY_TEMPLATE.format(
+        account_id=str(account_id or ""),
+        user_order_id=str(user_order_id or ""),
+    )
+
+
 def _attr(obj, names, default=None):
     for name in names:
         if isinstance(obj, dict):
@@ -109,24 +129,24 @@ def _qmt_datetime(date_val, time_val):
     )
 
 
-def _stock_code_with_exchange(obj):
-    code = str(
-        _attr(obj, ["m_strInstrumentID", "stock_code", "m_strInstrument"], "") or "",
-    ).strip().upper()
-    if not code:
-        raise ValueError("QMT execution event is missing instrument ID")
-    if "." in code:
-        return code
+def _with_exchange_suffix(raw_code, obj):
+    """Append the exchange suffix to a bare instrument code.
 
+    Live order/deal callbacks carry ``m_strInstrumentID`` as the bare code
+    ('600000') while the exchange sits in ``m_strExchangeID`` — the same shape
+    ``get_trade_detail_data`` rows use. Native MiniQMT callback objects carry
+    the full '600000.SH' form, so events must match it. Codes that already
+    carry a suffix (or objects without exchange info) pass through unchanged.
+    """
+    text = str(raw_code or "")
+    if not text or "." in text:
+        return text
     exchange = str(
-        _attr(obj, ["m_strExchangeID", "exchange_id", "market"], "") or "",
+        _attr(obj, ["m_strExchangeID", "m_strMarketID", "exchange_id", "market"], "") or ""
     ).strip().upper()
-    if exchange not in {"SH", "SZ", "BJ"}:
-        raise ValueError(
-            "QMT execution event has no supported exchange ID for instrument %s: %r"
-            % (code, exchange),
-        )
-    return "%s.%s" % (code, exchange)
+    if exchange:
+        return "%s.%s" % (text, exchange)
+    return text
 
 
 def _action_from_direction(direction):
@@ -135,6 +155,37 @@ def _action_from_direction(direction):
     if direction in _SELL_DIRECTIONS:
         return "SELL"
     return ""
+
+
+def date_time_seconds(raw_date, raw_time):
+    """Combine a QMT date + time pair into Unix seconds; 0 when unavailable.
+
+    Official docs (dict.thinktrader.net, data_structure) leave the format of
+    m_strTradeDate/m_strTradeTime/m_strInsertDate/m_strInsertTime unspecified,
+    so tolerate the shapes seen in practice: date '20260819' or '2026-08-19',
+    time '093015', '09:30:15(.123)', or a full 'YYYY-MM-DD HH:MM:SS' carried
+    in the time field alone. Numeric timestamps pass through (ms normalized).
+    """
+    if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
+        value = float(raw_time)
+        if value > 1e11:  # ms epoch
+            value /= 1000.0
+        if value > 1e8:   # looks like an epoch, not HHMMSS
+            return int(value)
+
+    date_digits = "".join(ch for ch in str(raw_date or "") if ch.isdigit())
+    time_digits = "".join(ch for ch in str(raw_time or "") if ch.isdigit())
+    # Time field carrying its own date ('YYYYMMDDHHMMSS' or the dashed form).
+    if len(time_digits) >= 14:
+        date_digits, time_digits = time_digits[:8], time_digits[8:14]
+    if not date_digits or len(date_digits) < 8:
+        return 0
+    time_digits = (time_digits + "000000")[:6]  # pad to HHMMSS, drop ms
+    try:
+        parsed = time.strptime(date_digits[:8] + time_digits, "%Y%m%d%H%M%S")
+        return int(time.mktime(parsed))
+    except ValueError:
+        return 0
 
 
 def _is_buy(val):
@@ -267,7 +318,10 @@ _RAW_SNAPSHOT_EXTRA_FIELDS = (
     "trade_id",
     "traded_id",
     "strategy_name",
+    "strategyName",
+    "user_order_id",
     "order_remark",
+    "remark",
 )
 
 
@@ -341,20 +395,41 @@ def normalize_order_event(order, account_id=""):
     return {
         "event_type": EVENT_ORDER,
         "account_id": str(_attr(order, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": _stock_code_with_exchange(order),
+        "stock_code": _with_exchange_suffix(
+            _attr(order, ["m_strInstrumentID", "stock_code", "m_strInstrument"], ""), order
+        ),
         "order_sys_id": str(_attr(order, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
-        "order_volume": _attr(order, ["m_nVolumeTotal", "order_volume", "volume"]),
+        # MiniQMT XtOrder.order_volume is the ORIGINAL ordered volume; the
+        # remaining volume (m_nVolumeTotal) drops to 0 on the filled push.
+        "order_volume": _attr(
+            order, ["m_nVolumeTotalOriginal", "m_nVolumeTotal", "order_volume", "volume"]
+        ),
         "traded_volume": _attr(order, ["m_nVolumeTraded", "traded_volume"]),
         "price": _attr(order, ["m_dLimitPrice", "price", "limit_price"]),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
-        "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name", "order_remark", "remark"], "") or ""),
+        "strategy_name": str(_attr(order, ["strategyName", "m_strStrategyName", "strategy_name"], "") or ""),
         "remark": remark,
         "user_order_id": remark,
-        # QMT-recorded委托时间 (m_strInsertDate + m_strInsertTime), so downstream can
-        # persist the venue's order time rather than the local receive clock.
+        "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
+        # 委托状态描述。官方字段表: m_strCancelInfo=废单原因, m_strErrorMsg=状态信息。
+        # 柜台的拒单理由 ("[COUNTER] 资金可用余额不足，尚需[...]") 只在这里,
+        # 此前完全没有透传, 客户端看到的是一个没有原因的失败 (issue #60)。
+        "status_msg": str(
+            _attr(order, ["m_strCancelInfo", "m_strErrorMsg", "m_strStatusMsg",
+                          "status_msg", "error_msg"], "") or ""
+        ),
+        # 官方 Order 字段 m_strInsertDate+m_strInsertTime -> 真实报单 Unix 秒。
+        # 0 = 回调对象未携带 (老版本), 客户端会退回 created_at_ts。
+        "order_time": date_time_seconds(
+            _attr(order, ["m_strInsertDate", "m_strOrderDate", "insert_date", "order_date"]),
+            _attr(order, ["m_strInsertTime", "m_strOrderTime", "insert_time", "order_time"]),
+        ),
+        # QMT-recorded委托时间 (m_strInsertDate + m_strInsertTime) as a
+        # "YYYY-MM-DD HH:MM:SS" string, so downstream can persist the venue's
+        # order time rather than the local receive clock.
         "order_at": _qmt_datetime(
             _attr(order, ["m_strInsertDate", "insert_date", "order_date"], ""),
             _attr(order, ["m_strInsertTime", "insert_time", "order_time"], ""),
@@ -362,6 +437,51 @@ def normalize_order_event(order, account_id=""):
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }
+
+
+def remember_order_identity(redis_client, account_id, user_order_id, strategy_name="", stock_code="", ttl_seconds=86400):
+    user_order_id = str(user_order_id or "").strip()
+    if not user_order_id or redis_client is None:
+        return None
+    payload = {
+        "account_id": str(account_id or ""),
+        "user_order_id": user_order_id,
+        "strategy_name": str(strategy_name or ""),
+        "stock_code": str(stock_code or ""),
+        "created_at_ts": time.time(),
+    }
+    try:
+        redis_client.setex(
+            order_identity_key(account_id, user_order_id),
+            int(ttl_seconds or 86400),
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
+    except Exception:
+        pass
+    return payload
+
+
+def enrich_order_identity(redis_client, account_id, event):
+    if redis_client is None or not isinstance(event, dict):
+        return event
+    user_order_id = str(event.get("user_order_id") or event.get("remark") or "").strip()
+    if not user_order_id:
+        return event
+    try:
+        raw = redis_client.get(order_identity_key(account_id, user_order_id))
+    except Exception:
+        raw = None
+    if not raw:
+        return event
+    try:
+        identity = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
+    except Exception:
+        return event
+    if not event.get("strategy_name") and identity.get("strategy_name"):
+        event["strategy_name"] = str(identity.get("strategy_name") or "")
+    if not event.get("stock_code") and identity.get("stock_code"):
+        event["stock_code"] = str(identity.get("stock_code") or "")
+    return event
 
 
 def normalize_trade_event(trade, account_id=""):
@@ -378,7 +498,9 @@ def normalize_trade_event(trade, account_id=""):
     return {
         "event_type": EVENT_TRADE,
         "account_id": str(_attr(trade, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": _stock_code_with_exchange(trade),
+        "stock_code": _with_exchange_suffix(
+            _attr(trade, ["m_strInstrumentID", "stock_code"], ""), trade
+        ),
         "order_sys_id": str(_attr(trade, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "trade_id": str(_attr(trade, ["m_strTradeID", "trade_id"], "") or ""),
         "volume": _attr(trade, ["m_nVolume", "volume", "traded_volume"]),
@@ -388,8 +510,6 @@ def normalize_trade_event(trade, account_id=""):
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(trade, ["m_nOffsetFlag", "offset_flag"]),
-        "remark": remark,
-        "user_order_id": remark,
         # QMT-recorded成交时间. Prefer the full date+time (m_strTradeDate +
         # m_strTradeTime); fall back to a pre-normalized traded_at/trade_time string
         # (which may be time-only) for backward compatibility.
@@ -398,6 +518,18 @@ def normalize_trade_event(trade, account_id=""):
             _attr(trade, ["m_strTradeTime", "trade_time"], ""),
         )
         or str(_attr(trade, ["traded_at", "trade_time", "m_strTradeTime"], "") or ""),
+        # 和委托事件一致带上 remark。客户端要在拿到 order_sys_id 之前就把成交
+        # 关联到某笔异步委托 (issue #51)，而那时唯一已知的标识就是 remark。
+        # QMT 的成交行不一定有这个字段，取不到则为空，客户端退回按
+        # order_sys_id 关联。
+        "remark": remark,
+        "user_order_id": remark,
+        # 官方 Deal 字段 m_strTradeDate+m_strTradeTime -> 真实成交 Unix 秒。
+        # 0 = 未携带, 客户端会退回 created_at_ts。
+        "traded_time": date_time_seconds(
+            _attr(trade, ["m_strTradeDate", "trade_date", "m_strDealDate"]),
+            _attr(trade, ["m_strTradeTime", "trade_time", "traded_at"]),
+        ),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }
@@ -419,3 +551,56 @@ def publish_order_event(redis_client, account_id, event):
 
 def publish_trade_event(redis_client, account_id, event):
     return _publish(redis_client, trade_channel(account_id), event)
+
+
+def publish_order_error_event(redis_client, account_id, event):
+    return _publish(redis_client, order_error_channel(account_id), event)
+
+
+def publish_cancel_error_event(redis_client, account_id, event):
+    return _publish(redis_client, cancel_error_channel(account_id), event)
+
+
+def normalize_order_error_event(order_error, account_id=""):
+    """Build a JSON-able order-error event dict (废单/拒单).
+
+    QMT order callbacks carry the failed order via m_strOrderSysID / error info.
+    MiniQMT's on_order_error receives an XtOrderError with error_id/error_msg.
+    """
+    return {
+        "event_type": EVENT_ORDER_ERROR,
+        "account_id": str(_attr(order_error, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
+        "stock_code": str(_attr(order_error, ["m_strInstrumentID", "stock_code"], "") or ""),
+        "order_sys_id": str(_attr(order_error, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
+        "error_id": _attr(order_error, ["m_nErrorID", "error_id", "m_nOrderStatus"]),
+        # 废单状态和备注也要带上：客户端 on_order_error 需要 order_remark 关联
+        # 回报（issue #64），柜台拒单理由已在 error_msg（m_strCancelInfo，#60）。
+        "status": _attr(order_error, ["m_nOrderStatus", "status"]),
+        "order_remark": str(_attr(order_error, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
+        "user_order_id": str(_attr(order_error, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
+        # m_strCancelInfo 排在最前: 官方字段表把它标为「废单原因」, 而柜台的
+        # 拒单理由 ("[COUNTER] 资金可用余额不足，尚需[...]") 正是走这个字段。
+        # 之前只读 m_strErrorMsg, 于是 error_msg 常常是空的 (issue #60)。
+        "error_msg": str(
+            _attr(order_error, ["m_strCancelInfo", "m_strErrorMsg", "error_msg",
+                                "m_strMsg", "m_strStatusMsg", "status_msg"], "") or ""
+        ),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at_ts": time.time(),
+    }
+
+
+def normalize_cancel_error_event(cancel_error, account_id=""):
+    """Build a JSON-able cancel-error event dict (撤单失败)."""
+    return {
+        "event_type": EVENT_CANCEL_ERROR,
+        "account_id": str(_attr(cancel_error, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
+        "stock_code": str(_attr(cancel_error, ["m_strInstrumentID", "stock_code"], "") or ""),
+        "order_sys_id": str(_attr(cancel_error, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
+        "error_id": _attr(cancel_error, ["m_nErrorID", "error_id"]),
+        "order_remark": str(_attr(cancel_error, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
+        "user_order_id": str(_attr(cancel_error, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
+        "error_msg": str(_attr(cancel_error, ["m_strErrorMsg", "error_msg", "m_strMsg"], "") or ""),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at_ts": time.time(),
+    }

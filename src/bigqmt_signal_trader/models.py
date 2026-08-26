@@ -162,12 +162,33 @@ class TradeSignal:
 
 
 class PositionSnapshot:
-    def __init__(self, stock_code, volume, available, cost=0.0, stock_name=""):
+    def __init__(
+        self,
+        stock_code,
+        volume,
+        available,
+        cost=0.0,
+        stock_name="",
+        market_value=None,
+        price=None,
+        open_price=None,
+        frozen_volume=0,
+        on_road_volume=0,
+        yesterday_volume=None,
+        direction=48,
+    ):
         self.stock_code = stock_code
         self.volume = volume
         self.available = available
         self.cost = cost
         self.stock_name = stock_name
+        self.market_value = market_value
+        self.price = price
+        self.open_price = open_price
+        self.frozen_volume = frozen_volume
+        self.on_road_volume = on_road_volume
+        self.yesterday_volume = yesterday_volume
+        self.direction = direction
 
 
 class AssetSnapshot:
@@ -245,6 +266,8 @@ class OrderSnapshot:
         price=0.0,
         strategy_name="",
         remark="",
+        order_time=0,
+        status_msg="",
         order_at="",
     ):
         self.order_sys_id = order_sys_id
@@ -257,13 +280,21 @@ class OrderSnapshot:
         self.price = price
         self.strategy_name = strategy_name
         self.remark = remark
+        # 报单时间, Unix 秒 -- MiniQMT XtOrder.order_time 的语义。0 = 未上报。
+        # 追加在末尾并给默认值, 保持既有位置参数调用不受影响。
+        self.order_time = order_time
+        # 委托状态描述 —— MiniQMT XtOrder.status_msg 的语义 (如废单原因)。
+        # 柜台的拒单理由只在这里, 例如
+        # "[COUNTER] 资金可用余额不足，尚需[4789.630]" (issue #60)。
+        self.status_msg = status_msg
         # QMT-recorded委托时间 ("YYYY-MM-DD HH:MM:SS"); serialized via __dict__.
         self.order_at = order_at
 
 
 class TradeSnapshot:
     def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price,
-                 traded_at="", user_order_id="", commission=None):
+                 traded_at="", user_order_id="", amount=0.0, strategy_name="",
+                 traded_time=0, commission=None):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -272,6 +303,13 @@ class TradeSnapshot:
         self.price = price
         self.traded_at = traded_at
         self.user_order_id = user_order_id
+        # 官方 Deal 字段 m_dTradeAmount(成交额) / m_strTradeDate+m_strTradeTime。
+        # 追加在末尾并给默认值, 保持既有位置参数调用不受影响 (同 OrderSnapshot.order_time)。
+        self.amount = amount
+        # strategy_name 是查询过滤参数 (仅委托/成交有效): 按策略过滤时返回集
+        # 必属该策略, 因此直接回填; 空策略名查全部时保持 ""。
+        self.strategy_name = strategy_name
+        self.traded_time = traded_time
         # 手续费 (commission fee); QMT deal field m_dCommission (legacy m_dComssion/m_dComission).
         self.commission = commission
 

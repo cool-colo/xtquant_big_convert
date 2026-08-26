@@ -175,5 +175,65 @@ class RedisAdaptersTest(unittest.TestCase):
         self.assertIsInstance(app.position_sync_sink, RedisPositionSyncSink)
 
 
+class RedisProtocolCompatTest(unittest.TestCase):
+    """Issue #71：QMT 自带 redis-py 3.5.3 的 Redis.__init__ 没有 protocol 参数，
+    硬传直接 TypeError。按版本能力条件透传。"""
+
+    def _fake_redis_module(self, with_protocol):
+        import types
+
+        captured = {}
+
+        if with_protocol:
+            class FakeRedis:
+                def __init__(self, host=None, port=None, db=None, username=None,
+                             password=None, protocol=None, **kwargs):
+                    captured.update(kwargs)
+                    captured["protocol"] = protocol
+        else:
+            class FakeRedis:  # 模拟 redis-py 3.5.3：没有 protocol 参数
+                def __init__(self, host=None, port=None, db=None, username=None,
+                             password=None, **kwargs):
+                    captured.update(kwargs)
+
+        module = types.ModuleType("redis")
+        module.Redis = FakeRedis
+        return module, captured
+
+    def test_protocol_passed_when_supported(self):
+        import sys
+        from unittest import mock
+
+        from bigqmt_signal_trader.adapters import redis_common
+
+        module, captured = self._fake_redis_module(with_protocol=True)
+        with mock.patch.dict(sys.modules, {"redis": module}):
+            redis_common.build_redis_client({"host": "h", "port": 6379, "protocol": 3})
+        self.assertEqual(captured.get("protocol"), 3)
+
+    def test_protocol_skipped_when_unsupported(self):
+        import sys
+        from unittest import mock
+
+        from bigqmt_signal_trader.adapters import redis_common
+
+        module, captured = self._fake_redis_module(with_protocol=False)
+        with mock.patch.dict(sys.modules, {"redis": module}):
+            redis_common.build_redis_client({"host": "h", "port": 6379})
+        self.assertNotIn("protocol", captured)
+
+    def test_protocol_default_is_resp2(self):
+        # 显式不传时默认 2（Redis 5.0 只支持 RESP2，redis-py 8.x 默认 RESP3）
+        import sys
+        from unittest import mock
+
+        from bigqmt_signal_trader.adapters import redis_common
+
+        module, captured = self._fake_redis_module(with_protocol=True)
+        with mock.patch.dict(sys.modules, {"redis": module}):
+            redis_common.build_redis_client({"host": "h", "port": 6379})
+        self.assertEqual(captured.get("protocol"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

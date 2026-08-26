@@ -21,7 +21,9 @@ def get_local_data(field_list=[], stock_list=[], period="1d", start_time="", end
     return _compat.xtdata.get_local_data(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data, data_dir)
 
 
-def get_instrument_detail(stock_code):
+def get_instrument_detail(stock_code, is_detail=False):
+    # is_detail: 对齐原生 xtquant 双参签名; 桥接路径不区分详细/简要,
+    # 接收并忽略, 避免原生双参调用抛 TypeError。
     return _compat.xtdata.get_instrument_detail(stock_code)
 
 
@@ -73,12 +75,29 @@ def getDividFactors(*args, **kwargs):
     return _compat.xtdata.get_divid_factors(*args, **kwargs)
 
 
-def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None):
-    return _compat.xtdata.download_history_data(stock_code, period, start_time, end_time, incrementally)
+def submit_download_history_data(stock_code, period, start_time="", end_time="", incrementally=None):
+    return _compat.xtdata.submit_download_history_data(stock_code, period, start_time, end_time, incrementally)
 
 
-def download_history_data2(stock_list, period, start_time="", end_time="", callback=None, incrementally=None):
-    return _compat.xtdata.download_history_data2(stock_list, period, start_time, end_time, callback, incrementally)
+def submit_download_history_data2(stock_list, period, start_time="", end_time="", incrementally=None):
+    return _compat.xtdata.submit_download_history_data2(stock_list, period, start_time, end_time, incrementally)
+
+
+def get_download_status(job_id):
+    return _compat.xtdata.get_download_status(job_id)
+
+
+def wait_download(job_id, timeout=None, poll_interval=None, callback=None):
+    return _compat.xtdata.wait_download(job_id, timeout, poll_interval, callback)
+
+
+def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
+    # dividend_type 必须与随后的 get_local_data 一致, 否则复权缓存不命中。
+    return _compat.xtdata.download_history_data(stock_code, period, start_time, end_time, incrementally, dividend_type)
+
+
+def download_history_data2(stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none"):
+    return _compat.xtdata.download_history_data2(stock_list, period, start_time, end_time, callback, incrementally, dividend_type)
 
 
 def get_trading_dates(market, start_time="", end_time="", count=-1):

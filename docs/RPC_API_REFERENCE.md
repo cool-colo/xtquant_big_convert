@@ -64,6 +64,27 @@
 
 ---
 
+## 2.5 全推行情订阅（server 推送，对齐 miniqmt `subscribe_whole_quote`）
+
+这三个方法只管理**订阅生命周期与心跳**；行情数据本身走独立的 server→client 推送通道（zmq PUB/SUB 或 redis pub/sub，msgpack 编码、json 兜底），**不经过 RPC 响应**。多 client 订阅同一组合（`frozenset` 规范化）共享同一个大 QMT `ContextInfo.subscribe_whole_quote`，引用计数归零（全部退订或全部心跳超时）才真正退订大 QMT。详见 `docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md`。
+
+### `subscribe_whole_quote`
+- **参数**：`client_id`（str，必填，client 进程级稳定 id）、`sub_id`（str，必填，client 侧订阅号）、`codes`（list[str]，必填）：市场代码（`["SH","SZ"]`）或品种代码列表。
+- **返回**：`{"combo_key": str, "topic": str, "push_endpoint": str}`。`topic` 即推送通道的过滤主题；`push_endpoint` 为 zmq PUB 地址（redis 推送时为空，client 本地推导 channel 名）。
+- **语义**：首个 client 订阅该组合时建立大 QMT 订阅；同组合后续 client 共享。幂等（重复 subscribe 不重复建订阅，用于 server 重启后 client 重放恢复）。
+
+### `unsubscribe_whole_quote`
+- **参数**：`client_id`、`sub_id`（均 str，必填）。
+- **返回**：`{}`。
+- **语义**：移除该 `(client_id, sub_id)` 的引用；该组合最后一个 client 离开时退订大 QMT。未知 sub_id 为 no-op。
+
+### `quote_keepalive`
+- **参数**：`client_id`、`sub_id`（均 str，必填）。
+- **返回**：`{}`。
+- **语义**：刷新该订阅的 `last_seen`。client 每 `heartbeat_interval`（默认 3s）发送一次；server 端某 client 超过 `heartbeat_timeout_seconds`（默认 30s = 10 个心跳周期）无心跳则被 reaper 移除，组合清空后退订大 QMT。
+
+---
+
 ## 3. 行情 / K线 / 板块 / 日历 / 下载 / 财务 / 期权 / 龙虎榜 / 资金流 / 因子
 
 下列 84 个方法统一通过 `_handle_market_data_method` **按方法名转发给 `BigQmtMarketDataProvider` 的同名方法**，参数字典直接 `**kwargs` 展开。调用方按下方签名传参即可。客户端兼容层对常用方法有显式封装，其余用 `xtdata.call_method(name, **params)`。
