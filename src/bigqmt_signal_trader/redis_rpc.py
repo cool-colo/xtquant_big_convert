@@ -2730,6 +2730,9 @@ class BigQmtRpcHandlers:
     def _exec_event_sink(self):
         """Where an exec event this handler emits goes: redis, else the quote
         push channel, else None."""
+        explicit = getattr(self, "exec_event_sink", None)
+        if explicit is not None:
+            return explicit
         redis_client = self._identity_redis()
         if redis_client is not None:
             return redis_client

@@ -47,6 +47,7 @@ dev = [
 
 [project.scripts]
 bigqmt-init = "bigqmt_signal_trader.init_config:main"
+bigqmt-redis-pipe-proxy = "bigqmt_signal_trader.redis_pipe_proxy:main"
 
 [project.urls]
 Homepage = "https://github.com/litaolemo/xtquant_big_convert"

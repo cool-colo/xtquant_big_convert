@@ -29,6 +29,7 @@ pip install xtquant-big-convert
 功能说明不放在这里。按需要查阅：
 
 - `docs/USER_GUIDE.md` — 使用指南（功能、配置、部署、排错）
+- `docs/REDIS_PIPE_PROXY_USAGE_CN.md` — Redis—命名管道代理中文部署与使用指南
 - `docs/` 其余文件 — RPC 协议、API 参考、传输层、延迟报告等专项文档
 - `src/` 下的代码注释与 docstring — 实现细节的第一手来源
 - `tests/` — 行为契约以测试为准

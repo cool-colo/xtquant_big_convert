@@ -150,6 +150,16 @@ def render_server_config(answers):
             "    # server bind all interfaces; restrict that port with a firewall.",
             '    "zmq": {"bind_address": "tcp://%s:%d"},' % (bind_host, port),
         ])
+    elif str(answers["transport"]) == "pipe":
+        lines.extend([
+            '    "redis_enabled": False,',
+            '    "pipe": {"pipe_name": "bigqmt_rpc"},',
+            '    "exec_events_transport": "pipe",',
+            '    "exec_events_pipe_name": "bigqmt_exec",',
+            '    "exec_events_queue_capacity": 4096,',
+            '    "exec_events_connect_timeout_seconds": 0.25,',
+            '    "exec_events_ack_timeout_seconds": 2.0,',
+        ])
     if answers["allow_order_methods"]:
         lines.append("    # Remote order/cancel is ON. Turn it off if you only need queries.")
     else:
@@ -218,6 +228,16 @@ def render_client_config(answers):
             '        "port": %d,' % port,
             '        "connect_address": "tcp://%s:%d",' % (str(answers["host"]), port),
             "    },",
+        ])
+    elif transport == "pipe":
+        lines.extend([
+            '    "redis_enabled": False,',
+            '    "pipe": {"pipe_name": "bigqmt_rpc"},',
+            '    "exec_events_transport": "pipe",',
+            '    "exec_events_pipe_name": "bigqmt_exec",',
+            '    "exec_events_queue_capacity": 4096,',
+            '    "exec_events_connect_timeout_seconds": 0.25,',
+            '    "exec_events_ack_timeout_seconds": 2.0,',
         ])
     lines.extend([
         "}",

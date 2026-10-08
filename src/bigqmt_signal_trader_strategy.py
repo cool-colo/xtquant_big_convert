@@ -137,6 +137,7 @@ _credit_callback_fired = 0
 _rpc_service = None
 _quote_subscription_service = None  # (QuoteSubscriptionManager, QuotePushChannel)
 _exec_event_redis_client = None  # reused; building a new client per trade callback leaks
+_exec_event_pipe_sink_instance = None
 _scheduled_adjust = False
 # Latency tuning / diagnostics (server side, in the Big QMT process).
 #  - switch interval: hand the GIL to the background RPC thread ~5x more often
@@ -404,6 +405,7 @@ def _perform_reload(context_info):
 def reset_app():
     global _adjust_logged, _rpc_service, _scheduled_adjust, _last_full_tick_refresh_at, _last_full_tick_market_refresh_at
     global _quote_subscription_service, _exec_event_redis_client
+    global _exec_event_pipe_sink_instance
     _adjust_logged = False
     _scheduled_adjust = False
     _last_full_tick_refresh_at = 0.0
@@ -435,6 +437,12 @@ def reset_app():
         except Exception:
             pass
     _quote_subscription_service = None
+    if _exec_event_pipe_sink_instance is not None:
+        try:
+            _exec_event_pipe_sink_instance.stop()
+        except Exception:
+            pass
+    _exec_event_pipe_sink_instance = None
     # Drop the reused exec-event redis client so the next run rebuilds it fresh.
     _exec_event_redis_client = None
     _reset_runner_app()
@@ -793,6 +801,8 @@ def _build_rpc_service(context_info, app, config):
     _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
     handlers.download_job_redis_client = _store_redis
     handlers.order_identity_redis_client = _store_redis
+    if str((config.get("exec_events") or {}).get("transport") or "").lower() == "pipe":
+        handlers.exec_event_sink = _get_exec_event_pipe_sink(config)
     # Settlement reads the callback-fed watch table first (issue #164).
     handlers.order_watch_table = _order_watch_table
     # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
@@ -1700,11 +1710,43 @@ def _exec_event_sink(config):
     the push channel takes over, because an unreachable redis was otherwise
     swallowing every callback while a working channel stood idle (issue #145).
     """
+    event_config = dict(config.get("exec_events") or {})
+    if str(event_config.get("transport") or "").lower() == "pipe":
+        return _get_exec_event_pipe_sink(config)
     if not _exec_sink_state["demoted"]:
         redis_client = _exec_event_redis(config)
         if redis_client is not None:
             return redis_client
     return _push_channel_sink()
+
+
+def _get_exec_event_pipe_sink(config):
+    """Build one non-blocking pipe sink per strategy run."""
+    global _exec_event_pipe_sink_instance
+    if _exec_event_pipe_sink_instance is not None:
+        return _exec_event_pipe_sink_instance
+    event_config = dict(config.get("exec_events") or {})
+    if not _config_bool(event_config.get("enabled"), True):
+        return None
+    try:
+        if _load_bridge_module is not None:
+            builder = _load_bridge_module(
+                "bigqmt_signal_trader.exec_event_pipe").build_exec_event_pipe_sink
+        else:
+            from bigqmt_signal_trader.exec_event_pipe import build_exec_event_pipe_sink
+            builder = build_exec_event_pipe_sink
+        account_id = str(
+            event_config.get("account_id") or config.get("account_id") or _account_id or ""
+        )
+        _exec_event_pipe_sink_instance = builder(
+            event_config, account_id,
+            log=lambda message: _log_err("exec_event_pipe", message),
+        )
+        _exec_event_pipe_sink_instance.start()
+    except Exception as exc:
+        _log_err("exec_event_pipe", "sink start failed: %s" % exc)
+        _exec_event_pipe_sink_instance = None
+    return _exec_event_pipe_sink_instance
 
 
 def _note_exec_publish_failure(kind, exc):
