@@ -78,6 +78,34 @@ class AsyncCallbackOrderTest(unittest.TestCase):
             return {"order_sys_id": "sys-1", "user_order_id": "TAG-1"}
 
         trader.order_stock_result = submit or default_submit
+
+        def default_batch(account, orders, batch_id="", idempotent=True):
+            # The worker batches a backlog of >=2 into one order_stock_batch
+            # (issue #181); route each item through the same stub the single
+            # path uses so both paths behave identically under test.
+            results = []
+            for index, item in enumerate(orders):
+                single = trader.order_stock_result(
+                    account, item.get("stock_code"), item.get("order_type"),
+                    item.get("order_volume"), item.get("price_type"),
+                    item.get("price"), item.get("strategy_name"),
+                    item.get("order_remark"),
+                    wait_settlement=item.get("wait_settlement", True))
+                if isinstance(single, dict):
+                    sys_id = str(single.get("order_sys_id") or "")
+                else:
+                    sys_id = str(single or "")
+                results.append({
+                    "index": index, "success": sys_id != "-1",
+                    "order_sys_id": sys_id,
+                    "user_order_id": str((single or {}).get("user_order_id") or "")
+                    if isinstance(single, dict) else "",
+                    "code": 0 if sys_id != "-1" else -1,
+                    "error": "" if sys_id != "-1" else "order_stock returned -1",
+                })
+            return results
+
+        trader.order_stock_batch = default_batch
         return trader, recorder, gate
 
     def _submit(self, trader, remark="TAG-1"):
@@ -128,7 +156,7 @@ class AsyncCallbackOrderTest(unittest.TestCase):
 
         self.assertEqual(rec.names(), ["response", "order"])
         resp = rec.seen[0][1]
-        self.assertEqual(resp.order_id, "xt-real-1")
+        self.assertEqual(str(resp.order_id), "xt-real-1")
         self.assertEqual(resp.order_sysid, "xt-real-1")
 
     def test_response_falls_back_to_remark_when_no_id_learned(self):
@@ -143,7 +171,7 @@ class AsyncCallbackOrderTest(unittest.TestCase):
 
         resp = rec.seen[0][1]
         self.assertEqual(rec.names(), ["response"])
-        self.assertEqual(resp.order_id, "TAG-1")
+        self.assertEqual(str(resp.order_id), "TAG-1")
         self.assertEqual(resp.order_sysid, "")
 
 

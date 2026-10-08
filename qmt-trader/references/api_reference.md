@@ -488,6 +488,13 @@ print(resp["data"]["000001.SZ"]["lastPrice"])
 ### 期权定价
 `bsm_price`, `bsm_iv`, `get_option_iv`
 
+客户端扩展（不走 RPC 数学计算）：
+
+- `get_option_analytics(opt_code, option_price=None, underlying_price=None, as_of=None, risk_free_rate=None, dividend_yield=0.0, price_period="1m", include_native_iv=False)`：返回 IV、Delta/Gamma/Vega/Theta/Rho、内在/时间价值和明确的 Greek 单位。缺省价格取期权和标的最新 close；盘口中间价应通过显式价格传入。
+- `get_option_chain_analytics(undl_code, dedate, ...)`：批量计算一个到期月份，返回 `valid_count` / `error_count` 和 `contracts`。无套利边界不成立或缺价的合约保留 `analytics_error`，不会让整条链失败。
+
+CLI：`option-greeks 10010975.SHO`（单合约）或 `option-greeks 510050.SH --expiry 202609`（整条链）。
+
 ### 龙虎榜/股东
 `get_longhubang`, `get_top10_share_holder`, `get_holder_num`, `get_turnover_rate`,
 `get_industry`, `get_his_st_data`, `get_his_index_data`

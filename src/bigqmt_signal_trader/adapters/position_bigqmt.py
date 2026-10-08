@@ -1,7 +1,8 @@
 """Big QMT position and asset adapters."""
 
+from ..account_type_map import account_type_for
 from ..code_utils import normalize_stock_code
-from ..models import AssetSnapshot, PositionSnapshot
+from ..models import AssetSnapshot, PositionSnapshot, PositionStatisticsSnapshot
 
 
 def _attr(obj, names, default=None):
@@ -11,6 +12,31 @@ def _attr(obj, names, default=None):
             if value is not None:
                 return value
     return default
+
+
+def _required_count(row, names, label, code, account_id):
+    """An integer the terminal must give for a position; a missing one is an
+    error, never a zero (issue #290).
+
+    ``m_nVolume`` / ``m_nCanUseVolume`` / ``m_nYesterdayVolume`` used to go
+    through ``int(_attr(row, names, 0) or 0)``, so a row that lacked the
+    attribute serialised exactly like a row that said 0. A caller could not
+    tell "the terminal did not say how much I hold" from "I hold nothing" --
+    and a strategy that reads 0 as "flat" buys again, one that reads 0 as
+    "nothing sellable" never sells. Reporting the row as unknown is worse
+    than refusing the query: #229/#230 already route a failed native query
+    to the RPC error path (ok=False, error=...) instead of an empty answer,
+    and this is the same class of failure one row down. A native 0 is still
+    a 0; an empty native result is still an empty result.
+    """
+    value = _attr(row, names)
+    if value is None:
+        raise ValueError(
+            "POSITION row for %s (account %s) carries no %s (looked for %s); "
+            "refusing to report 0 for a count the terminal did not give -- a "
+            "missing count and a real zero must not look alike (#290)"
+            % (code, account_id, label, "/".join(names)))
+    return int(value)
 
 
 def _float_or_none(value):
@@ -65,7 +91,7 @@ def _report_missing_field(label, row, candidates):
 # POSITION/ORDER/DEAL rows. The same token is appended as the ContextInfo code
 # suffix (a2609.DF, rb2401.SF, 000001.SZ, 00700.HGT).
 # Stock/mutual-fund/HK-Connect markets: case-insensitive, unified via normalize.
-_STOCK_EXCHANGE_TOKENS = frozenset({"SH", "SZ", "BJ", "HK", "HGT", "SGT"})
+_STOCK_EXCHANGE_TOKENS = frozenset({"SH", "SZ", "BJ", "HK", "HGT", "SGT", "SHO", "SZO"})
 # Futures XunTou-short exchange tokens: only concatenate the suffix. The symbol
 # must follow each exchange's canonical naming and is case-sensitive
 # (AP401.ZF upper-case / rb2401.SF lower-case, not interchangeable), so never
@@ -144,20 +170,28 @@ class BigQmtPositionProvider:
         self.get_trade_detail_data = get_trade_detail_data_func
         self.account_type = account_type
 
+    def _resolve_account_type(self, account_id):
+        """Per-request account_type: map lookup if configured, else default."""
+        return account_type_for(account_id, self.account_type)
+
     def _require_query_func(self):
         if self.get_trade_detail_data is None:
             raise RuntimeError("get_trade_detail_data is not available in Big QMT runtime")
         return self.get_trade_detail_data
 
-    def get_positions(self, account_id):
+    def list_positions(self, account_id):
+        """Return every native POSITION row without collapsing by stock code.
+
+        Stock-option accounts can hold a long (rights) and short (obligation)
+        position in the same contract at the same time.  The public
+        ``query_stock_positions`` compatibility API is list-shaped, so both
+        rows must survive conversion even though the legacy provider contract
+        below remains a mapping keyed by stock code.
+        """
         query = self._require_query_func()
-        # QMT's get_trade_detail_data can raise on POSITION queries in some
-        # states (e.g. context not bound). Degrade to empty like get_asset does.
-        try:
-            rows = query(account_id, self.account_type, "POSITION") or []
-        except Exception:
-            return {}
-        positions = {}
+        # Let query failures reach the RPC error handler instead of reporting empty positions.
+        rows = query(account_id, self._resolve_account_type(account_id), "POSITION") or []
+        positions = []
         for row in rows:
             try:
                 code = _full_code(
@@ -167,10 +201,11 @@ class BigQmtPositionProvider:
             except Exception as exc:
                 skip_unparsable_row("POSITION", row, exc)
                 continue
-            positions[code] = PositionSnapshot(
+            positions.append(PositionSnapshot(
                 stock_code=code,
-                volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
-                available=int(_attr(row, ("m_nCanUseVolume", "available", "can_use_volume"), 0) or 0),
+                volume=_required_count(row, ("m_nVolume", "volume"), "volume", code, account_id),
+                available=_required_count(
+                    row, ("m_nCanUseVolume", "available", "can_use_volume"), "available", code, account_id),
                 cost=float(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "cost"), 0.0) or 0.0),
                 stock_name=str(_attr(row, ("m_strInstrumentName", "stock_name"), "") or ""),
                 market_value=_float_or_none(_attr(row, ("m_dMarketValue", "m_dInstrumentValue", "market_value"))),
@@ -178,17 +213,104 @@ class BigQmtPositionProvider:
                 open_price=_float_or_none(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "open_price", "cost"))),
                 frozen_volume=int(_attr(row, ("m_nFrozenVolume", "frozen_volume"), 0) or 0),
                 on_road_volume=int(_attr(row, ("m_nOnRoadVolume", "on_road_volume"), 0) or 0),
-                yesterday_volume=int(_attr(row, ("m_nYesterdayVolume", "yesterday_volume"), 0) or 0),
+                yesterday_volume=_required_count(
+                    row, ("m_nYesterdayVolume", "yesterday_volume"), "yesterday_volume", code, account_id),
                 direction=int(_attr(row, ("m_nDirection", "direction"), 48) or 48),
-            )
+            ))
         return positions
+
+    def get_positions(self, account_id):
+        """Return the legacy stock-code mapping used by the internal app.
+
+        Keep this contract unchanged for existing risk and position-sync
+        callers.  Code that needs every direction must use ``list_positions``.
+        """
+        return {
+            position.stock_code: position
+            for position in self.list_positions(account_id)
+        }
+
+    def get_position_statistics(self, account_id):
+        query = self._require_query_func()
+        try:
+            rows = query(account_id, self._resolve_account_type(account_id), "POSITION_STATISTICS") or []
+        except Exception:
+            return []
+        stats = []
+        for row in rows:
+            try:
+                code = _full_code(
+                    _attr(row, ("m_strInstrumentID", "instrument_id", "stock_code")),
+                    _attr(row, ("m_strExchangeID", "exchange_id", "market")),
+                )
+            except Exception as exc:
+                skip_unparsable_row("POSITION_STATISTICS", row, exc)
+                continue
+            stats.append(
+                PositionStatisticsSnapshot(
+                    account_id=account_id,
+                    exchange_id=str(_attr(row, ("m_strExchangeID", "exchange_id", "market"), "") or ""),
+                    exchange_name=str(_attr(row, ("m_strExchangeName", "exchange_name"), "") or ""),
+                    product_id=str(_attr(row, ("m_strProductID", "product_id"), "") or ""),
+                    instrument_id=str(_attr(row, ("m_strInstrumentID", "instrument_id"), "") or ""),
+                    instrument_name=str(_attr(row, ("m_strInstrumentName", "instrument_name"), "") or ""),
+                    stock_code=code,
+                    direction=int(_attr(row, ("m_nDirection", "direction"), 0) or 0),
+                    hedge_flag=int(_attr(row, ("m_nHedgeFlag", "hedge_flag"), 0) or 0),
+                    position=int(_attr(row, ("m_nPosition", "position"), 0) or 0),
+                    yesterday_position=int(_attr(row, ("m_nYestodayPosition", "yesterday_position"), 0) or 0),
+                    today_position=int(_attr(row, ("m_nTodayPosition", "today_position"), 0) or 0),
+                    can_close_vol=int(_attr(row, ("m_nCanCloseVol", "can_close_vol"), 0) or 0),
+                    position_cost=_float_or_none(_attr(row, ("m_dPositionCost", "position_cost"))),
+                    avg_price=_float_or_none(_attr(row, ("m_dAvgPrice", "avg_price"))),
+                    position_profit=_float_or_none(_attr(row, ("m_dPositionProfit", "position_profit"))),
+                    float_profit=_float_or_none(_attr(row, ("m_dFloatProfit", "float_profit"))),
+                    open_price=_float_or_none(_attr(row, ("m_dOpenPrice", "open_price"))),
+                    used_margin=_float_or_none(_attr(row, ("m_dUsedMargin", "used_margin"))),
+                    used_commission=_float_or_none(_attr(row, ("m_dUsedCommission", "used_commission"))),
+                    frozen_margin=_float_or_none(_attr(row, ("m_dFrozenMargin", "frozen_margin"))),
+                    frozen_commission=_float_or_none(_attr(row, ("m_dFrozenCommission", "frozen_commission"))),
+                    instrument_value=_float_or_none(_attr(row, ("m_dInstrumentValue", "instrument_value"))),
+                    open_times=int(_attr(row, ("m_nOpenTimes", "open_times"), 0) or 0),
+                    open_volume=int(_attr(row, ("m_nOpenVolume", "open_volume"), 0) or 0),
+                    cancel_times=int(_attr(row, ("m_nCancelTimes", "cancel_times"), 0) or 0),
+                    last_price=_float_or_none(_attr(row, ("m_dLastPrice", "last_price"))),
+                    rise_ratio=_float_or_none(_attr(row, ("m_dRiseRatio", "rise_ratio"))),
+                    product_name=str(_attr(row, ("m_strProductName", "product_name"), "") or ""),
+                    royalty=_float_or_none(_attr(row, ("m_dRoyalty", "royalty"))),
+                    expire_date=str(_attr(row, ("m_strExpireDate", "expire_date"), "") or ""),
+                    assest_weight=_float_or_none(_attr(row, ("m_dAssestWeight", "assest_weight"))),
+                    increase_by_settlement=_float_or_none(
+                        _attr(row, ("m_dIncreaseBySettlement", "increase_by_settlement"))
+                    ),
+                    margin_ratio=_float_or_none(_attr(row, ("m_dMarginRatio", "margin_ratio"))),
+                    float_profit_divide_by_used_margin=_float_or_none(
+                        _attr(row, ("m_dFloatProfitDivideByUsedMargin", "float_profit_divide_by_used_margin"))
+                    ),
+                    float_profit_divide_by_balance=_float_or_none(
+                        _attr(row, ("m_dFloatProfitDivideByBalance", "float_profit_divide_by_balance"))
+                    ),
+                    today_profit_loss=_float_or_none(_attr(row, ("m_dTodayProfitLoss", "today_profit_loss"))),
+                    yesterday_init_position=int(
+                        _attr(row, ("m_nYestodayInitPosition", "yesterday_init_position"), 0) or 0
+                    ),
+                    frozen_royalty=_float_or_none(_attr(row, ("m_dFrozenRoyalty", "frozen_royalty"))),
+                    today_close_profit_loss=_float_or_none(
+                        _attr(row, ("m_dTodayCloseProfitLoss", "today_close_profit_loss"))
+                    ),
+                    close_profit=_float_or_none(_attr(row, ("m_dCloseProfit", "close_profit"))),
+                    ft_product_name=str(_attr(row, ("m_strFtProductName", "ft_product_name"), "") or ""),
+                    open_cost=_float_or_none(_attr(row, ("m_dOpenCost", "open_cost"))),
+                )
+            )
+        return stats
 
     def get_asset(self, account_id):
         query = self._require_query_func()
         rows = []
         for detail_type in ("ACCOUNT", "ASSET"):
             try:
-                rows = query(account_id, self.account_type, detail_type) or []
+                rows = query(account_id, self._resolve_account_type(account_id), detail_type) or []
                 if rows:
                     break
             except Exception:
@@ -197,6 +319,7 @@ class BigQmtPositionProvider:
             return AssetSnapshot(account_id=account_id, cash=None, total_asset=None)
 
         row = rows[0]
+        fetch_balance = _float_or_none(_attr(row, ("m_dFetchBalance", "fetch_balance")))
         cash = _attr(row, ("m_dAvailable", "m_dAvailableCash", "available_cash", "cash"))
         total_asset = _attr(row, ("m_dBalance", "m_dAsset", "total_asset", "asset"))
         frozen_cash = _attr(row, _FROZEN_CASH_FIELDS)
@@ -211,6 +334,7 @@ class BigQmtPositionProvider:
                 market_value -= float(frozen_cash)
         return AssetSnapshot(
             account_id=account_id,
+            fetch_balance=fetch_balance,
             cash=float(cash) if cash is not None else None,
             total_asset=float(total_asset) if total_asset is not None else None,
             frozen_cash=float(frozen_cash) if frozen_cash is not None else None,

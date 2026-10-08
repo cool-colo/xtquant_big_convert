@@ -7,7 +7,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from bigqmt_signal_trader.models import SignalAction, SignalStatus, TradeSignal
+from bigqmt_signal_trader.models import OrderSnapshot, SignalAction, SignalStatus, TradeSignal
 
 
 def _base_payload(**kwargs):
@@ -53,6 +53,13 @@ class TradeSignalModelTest(unittest.TestCase):
         now = datetime.datetime(2026, 6, 30, 9, 32, 1)
 
         self.assertTrue(signal.is_expired(now))
+
+    def test_order_snapshot_old_positional_constructor_keeps_optional_price_type_none(self):
+        """新增可选字段不能改变旧位置参数构造契约。"""
+        order = OrderSnapshot("sys-1", "user-1", "600000.SH", "BUY", 100, 0, "50", 10.1, "strategy", "remark", 123, "")
+
+        self.assertIsNone(order.price_type)
+        self.assertEqual(order.traded_price, 0.0)
 
 
 if __name__ == "__main__":

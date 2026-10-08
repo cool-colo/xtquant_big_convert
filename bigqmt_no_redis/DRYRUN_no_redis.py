@@ -11,7 +11,12 @@ Use this when your QMT environment cannot import the redis package (e.g. broker
 whitelist blocks it) or when you want zero redis dependency.
 
 Config: set "transport": "zmq" in bigqmt_signal_trader_local_config.py (the
-no-redis runtime forces zmq regardless). Redis config fields are ignored.
+no-redis runtime forces zmq regardless). Redis config fields are ignored --
+this entry also forces redis_enabled=False, so nothing here ever dials redis.
+That costs the strategy_name backfill on queries (issue #133), async download
+jobs and the whole-quote snapshot cache; the last two are off by default on
+Big QMT anyway. Order and trade callbacks are unaffected -- they take the zmq
+push channel.
 """
 import builtins as _builtins
 import importlib as _importlib
@@ -207,7 +212,15 @@ try:
     BIGQMT_REDIS_CONFIG = dict(BIGQMT_REDIS_CONFIG or {})
     BIGQMT_REDIS_CONFIG["transport"] = "zmq"
     BIGQMT_REDIS_CONFIG["rpc_background_threads"] = True
-    print("[bigqmt_shell] no-redis mode: transport=zmq background_threads=True")
+    # And say so, rather than leaving the runtime to fill in 127.0.0.1:6379 from
+    # its defaults. Without this the redis block is emitted anyway, exec events
+    # prefer a client that can never connect, and every order/trade callback
+    # times out while the zmq push channel sits idle (issues #145 / #147). This
+    # file exists because the machine cannot import redis at all, so there is
+    # nothing to weigh up here.
+    BIGQMT_REDIS_CONFIG["redis_enabled"] = False
+    print("[bigqmt_shell] no-redis mode: transport=zmq background_threads=True "
+          "redis_enabled=False")
     _runtime.configure_runtime_redis(BIGQMT_REDIS_CONFIG)
 except Exception as redis_config_error:
     print("[bigqmt_shell] local redis config load failed: %s" % redis_config_error)
@@ -224,16 +237,13 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate", "down_history_data",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # QMT only injects its globals into the namespace of the file it mounts --
+    # THIS one -- so the capture has to happen here, with this file's globals().
+    # Read the strategy module's single source instead of hand-copying the
+    # names: a copy here is how query_credit_account went missing on the redis
+    # entry, and the bridge then reported it as "this terminal does not have
+    # that function" when the terminal had it all along (#202).
+    qmt_extra = _runtime.capture_qmt_injected_funcs(globals())
     print("[bigqmt_shell] down_history_data bound=%s" % ("down_history_data" in qmt_extra))
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
@@ -250,3 +260,7 @@ handlebar = _runtime.handlebar
 adjust = _runtime.adjust
 order_callback = _runtime.order_callback
 deal_callback = _runtime.deal_callback
+# Credit-account counter query callback. QMT only calls back into the
+# namespace of the file it mounted, so this has to be re-exported here
+# the same way order_callback / deal_callback are (#202).
+credit_account_callback = _runtime.credit_account_callback

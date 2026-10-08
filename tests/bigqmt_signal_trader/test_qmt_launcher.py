@@ -70,7 +70,7 @@ class ProcessStub(object):
 
 class ResolveInstallDirTest(unittest.TestCase):
     def test_accepts_root_bin_and_exe_paths(self):
-        expected = os.path.normpath("D:/qmt_lemo/bin.x64")
+        expected = os.path.abspath("D:/qmt_lemo/bin.x64")
         orig = os.path.isdir
         os.path.isdir = lambda p: os.path.basename(os.path.normpath(p)).lower() == "bin.x64"
         try:
@@ -225,6 +225,38 @@ class OpenQmtTest(unittest.TestCase):
                 qmt_launcher.open_qmt("D:/qmt_lemo", mode="bat", bat_path="D:/nope.bat")
         finally:
             os.path.isdir = orig
+
+
+class LoginWindowDetectionTest(unittest.TestCase):
+    def test_known_styles_do_not_depend_on_dpi_or_window_size(self):
+        self.assertEqual(qmt_launcher.classify_qmt_window(0x96000000), "login")
+        self.assertEqual(qmt_launcher.classify_qmt_window(0x960b0000), "main")
+        self.assertEqual(qmt_launcher.classify_qmt_window(0x970b0000), "main")
+        self.assertEqual(qmt_launcher.classify_qmt_window(0xb60b0000), "main")
+        self.assertEqual(qmt_launcher.classify_qmt_window(0x96000000 - 2**32), "login")
+
+    def test_unknown_styles_cannot_be_treated_as_login_or_main(self):
+        for style in (None, "bad", 0, 0x90000000, 0x96080000, 0x960f0000, 0xd6000000):
+            self.assertEqual(qmt_launcher.classify_qmt_window(style), "unknown", style)
+
+    def test_completion_waits_through_login_unknown_and_missing_windows(self):
+        handles = iter((10, 0, 30, 20))
+        styles = {10: 0x96000000, 30: 0, 20: 0x960b0000}
+        result = qmt_launcher._wait_for_main_window(
+            lambda: next(handles),
+            lambda h: qmt_launcher.classify_qmt_window(styles[h]),
+            timeout_seconds=1.0, poll_interval=0.0,
+        )
+        self.assertEqual(result, 20)
+
+    def test_completion_rejects_persistent_login_and_unknown_window(self):
+        for style in (0x96000000, 0):
+            result = qmt_launcher._wait_for_main_window(
+                lambda: 10,
+                lambda h: qmt_launcher.classify_qmt_window(style),
+                timeout_seconds=0.0, poll_interval=0.0,
+            )
+            self.assertIsNone(result)
 
 
 if __name__ == "__main__":

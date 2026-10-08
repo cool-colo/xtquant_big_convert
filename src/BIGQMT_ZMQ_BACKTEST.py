@@ -78,6 +78,39 @@ def _find_source(name):
     raise ModuleNotFoundError("local source not found: %s" % name, name=name)
 
 
+# A file that arrived corrupted fails with a bare NameError naming a long
+# token, which says nothing about the file being broken (issue #102). Python
+# read line 1 as a variable name because that is all it was: the file had been
+# saved from something other than the source -- a download page, or a mirror
+# that served a token instead of the file. Every version behaves the same way,
+# so "try a different version" sends people in the wrong direction.
+_TOKEN_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=+/")
+
+
+def _looks_like_a_token_not_python(source):
+    """True when the first real line cannot be Python at all.
+
+    Deliberately narrow. A Python line this long with no whitespace and
+    nothing outside the base64 alphabet would have to be a bare identifier,
+    which is already broken -- so a false positive costs a clearer message on
+    code that was going to fail anyway.
+    """
+    try:
+        if isinstance(source, bytes):
+            source = source.decode("utf-8", "replace")
+        for line in source.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            return (len(line) >= 40
+                    and not any(char.isspace() for char in line)
+                    and all(char in _TOKEN_CHARS for char in line))
+    except Exception:
+        pass
+    return False
+
+
 def _load_local_module(name):
     existing = sys.modules.get(name)
     if existing is not None:
@@ -102,11 +135,23 @@ def _load_local_module(name):
         exec(compile(source, source_path, "exec"), module.__dict__)
     except Exception:
         sys.modules.pop(name, None)
+        if _looks_like_a_token_not_python(source):
+            raise RuntimeError(
+                "%s is not Python source -- its first line is one long token, "
+                "so the file was saved from something other than the code (a "
+                "download page, or a mirror that served a token). Fetch the "
+                "file again. A different version will not help; every version "
+                "fails the same way on this file." % source_path)
         raise
     if "." in name:
         parent_name, child_name = name.rsplit(".", 1)
         setattr(_load_local_module(parent_name), child_name, module)
     return module
+
+
+# Names proven not to be modules. A miss costs a full sys.path
+# walk, so it is worth remembering; a hit never changes back.
+_MISSING_LOCAL_MODULES = set()
 
 
 def _local_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
@@ -116,10 +161,21 @@ def _local_import(name, module_globals=None, module_locals=None, fromlist=(), le
     module = _load_local_module(absolute_name)
     for child in fromlist or ():
         if child != "*":
+            child_name = absolute_name + "." + child
+            # A fromlist entry is usually an attribute, not a submodule.
+            # Looking one up walks _SOURCE_ROOT plus every sys.path entry
+            # doing os.path.isfile, then raises -- and nothing remembered the
+            # answer, so it ran again on EVERY `from X import Y` in the
+            # sandbox. Measured in the live terminal: a ping whose handler is
+            # one such import took 1493ms in handle(); with the miss
+            # remembered it takes 0ms, and the round trip went from ~1800ms to
+            # ~95-200ms.
+            if child_name in _MISSING_LOCAL_MODULES:
+                continue
             try:
-                _load_local_module(absolute_name + "." + child)
+                _load_local_module(child_name)
             except ModuleNotFoundError:
-                pass
+                _MISSING_LOCAL_MODULES.add(child_name)
     if fromlist:
         return module
     return _load_local_module(absolute_name.split(".", 1)[0])
@@ -148,5 +204,9 @@ init = _runtime.init
 handlebar = _runtime.handlebar
 order_callback = _runtime.order_callback
 deal_callback = _runtime.deal_callback
+# Credit-account counter query callback. QMT only calls back into the
+# namespace of the file it mounted, so this has to be re-exported here
+# the same way order_callback / deal_callback are (#202).
+credit_account_callback = _runtime.credit_account_callback
 stop = _runtime.stop
 after_backtest = _runtime.after_backtest

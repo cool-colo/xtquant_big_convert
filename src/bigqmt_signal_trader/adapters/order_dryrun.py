@@ -19,7 +19,7 @@ class DryRunOrderGateway:
             order_sys_id=None,
         )
 
-    def cancel(self, order_ref):
+    def cancel(self, order_ref, account_id=None):
         self.cancelled.append(order_ref)
         return None
 

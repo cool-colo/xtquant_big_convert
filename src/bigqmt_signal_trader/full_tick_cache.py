@@ -5,10 +5,12 @@ import json
 import pickle
 import time
 
-from .code_utils import normalize_stock_code
+from .code_utils import EXCHANGE_TOKENS, normalize_stock_code
 
 
-MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
+# Whole-exchange tokens, futures included: a token that normalize_stock_code
+# would reject must not reach it (issue #95).
+MARKET_CODES = set(EXCHANGE_TOKENS)
 DEMAND_KEY_TEMPLATE = "bigqmt:full_tick:demand:{account_id}"
 CACHE_KEY_TEMPLATE = "bigqmt:full_tick:cache:{account_id}:{request_id}"
 
@@ -27,12 +29,15 @@ def normalize_full_tick_codes(codes):
     normalized = []
     seen = set()
     for code in codes or []:
-        text = str(code or "").strip().upper()
+        text = str(code or "").strip()
         if not text:
             continue
-        if text in MARKET_CODES:
-            item = text
+        if text.upper() in MARKET_CODES:
+            item = text.upper()
         else:
+            # Pass the raw code through: futures symbol case is exchange
+            # convention and normalize_stock_code preserves it (issue #95).
+            # Uppercasing here would undo that before it ever gets the chance.
             item = normalize_stock_code(text)
         if item not in seen:
             seen.add(item)

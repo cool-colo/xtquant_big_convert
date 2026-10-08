@@ -83,7 +83,7 @@ class FakeOrderGateway:
 
         return OrderSubmitResult(status="SUBMITTED", user_order_id="bq:sig:1")
 
-    def cancel(self, order_ref):
+    def cancel(self, order_ref, account_id=None):
         return None
 
     def query_orders(self, account_id, strategy_name):

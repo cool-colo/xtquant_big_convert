@@ -73,3 +73,69 @@ def decode_text(value):
 
 def redis_mapping_to_text(mapping):
     return {decode_text(key): decode_text(value) for key, value in (mapping or {}).items()}
+
+
+# redis streams (XADD/XREAD) need redis >= 5.0. Older servers (Windows builds
+# are often 3.0.x) answer with "unknown command 'XADD'". Learn it once from the
+# failure, say it once, and let callers skip xadd from then on -- pub/sub keeps
+# working on those servers (issue #163).
+# 事件流的滑动过期时间。
+#
+# maxlen 只挡住单个键的无限增长，挡不住**键本身永远不消失**：换个账号、停用一个
+# 部署、跑一次探测，键就永远留在 redis 里。实测线上七个事件流全是永久键
+# （position_events 843KB、order_events 1.41MB…）。
+#
+# 所以每次 xadd 之后顺手续一次期：还在写的流一直续上，停了的自然消失。一天足够
+# 覆盖「昨天收盘到今天开盘」的回放需求，又不会让废弃账号的键长期占着（#213）。
+EVENT_STREAM_TTL_SECONDS = 86400
+
+
+def touch_stream_ttl(redis_client, key, ttl_seconds=EVENT_STREAM_TTL_SECONDS):
+    """给事件流续期。失败不能影响写入本身 —— 这是清理，不是主路径。"""
+    try:
+        ttl = int(ttl_seconds)
+    except (TypeError, ValueError):
+        return False
+    if ttl <= 0:
+        return False
+    try:
+        redis_client.expire(key, ttl)
+        return True
+    except Exception:
+        return False
+
+
+_STREAMS_DEAD = False
+
+
+def streams_dead():
+    return _STREAMS_DEAD
+
+
+def note_stream_failure(exc, log=None):
+    """True when *exc* is the redis<5.0 'unknown command' stream failure.
+
+    The first such failure logs once and marks streams dead process-wide.
+    Any other exception returns False and changes nothing (transient redis
+    issues stay retried).
+    """
+    global _STREAMS_DEAD
+    if "unknown command" not in str(exc or "").lower():
+        return False
+    if _STREAMS_DEAD:
+        return True
+    _STREAMS_DEAD = True
+    message = (
+        "redis has no streams support (XADD: unknown command, redis < 5.0): "
+        "event/position replay streams are disabled for this process; pub/sub "
+        "callbacks keep working. Upgrade the redis server to >= 5.0 to "
+        "restore replay."
+    )
+    try:
+        if log is not None:
+            log.warning(message)
+        else:
+            print("[bigqmt] " + message)
+    except Exception:
+        pass
+    return True

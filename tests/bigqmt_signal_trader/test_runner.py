@@ -175,5 +175,49 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
         self.assertEqual(self.app.sync_reasons, ["manual"])
 
 
+class CaptureQmtInjectedFuncsTest(unittest.TestCase):
+    """Strategy-side capture of QMT-injected globals from a mounted entry's
+    exec namespace.
+
+    QMT injects passorder / download_history_data / ... into the mounted
+    file's exec namespace only -- the strategy module's globals/builtins
+    lookups cannot see them, so a mounted entry must pass its globals() here
+    and feed the result to bind_qmt_api (verified live 2026-09-01:
+    get_ipo_info -> NotImplementedError, download_history_data -> False).
+    The name list lives in this module as the single source; the runtime's
+    mount capture goes through this helper instead of hand-copying names."""
+
+    def _noop(self, *args, **kwargs):
+        return None
+
+    def test_captures_callable_funcs_only(self):
+        captured = strategy_module.capture_qmt_injected_funcs(
+            {
+                "passorder": self._noop,
+                "download_history_data": self._noop,
+                "download_history_data2": None,
+                "unrelated": "x",
+            }
+        )
+        self.assertEqual(
+            captured,
+            {"passorder": self._noop, "download_history_data": self._noop},
+        )
+
+    def test_empty_when_not_injected(self):
+        self.assertEqual(strategy_module.capture_qmt_injected_funcs({}), {})
+        self.assertEqual(strategy_module.capture_qmt_injected_funcs(None), {})
+
+    def test_injected_set_is_derived_from_extra_funcs(self):
+        """Drift guard: the capture set must be the three trade entry points
+        plus _EXTRA_QMT_GLOBAL_FUNCS -- a name added to the extras registry is
+        captured automatically, a hand-written combined list is not."""
+        self.assertEqual(
+            strategy_module._QMT_INJECTED_GLOBAL_FUNCS,
+            ("passorder", "cancel", "get_trade_detail_data")
+            + strategy_module._EXTRA_QMT_GLOBAL_FUNCS,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

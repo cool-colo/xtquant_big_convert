@@ -8,10 +8,9 @@
 
 | 传输 | 同机 p50 | 跨机 | 依赖 | 适用场景 |
 |------|---------|------|------|---------|
-| `redis`（默认）| ~12ms | ✅ | redis-py | 生产默认，跨机也能用 |
-| **`zmq`** | **~0.2ms** | ✅（tcp） | pyzmq | 同机低延迟，主优化目标 |
+| **`redis`（默认）** | **~10ms** | ✅ | redis-py | 生产默认，也是实测最快的 |
+| `zmq` | ~95ms（drain）| ✅（tcp） | pyzmq | 没有 redis 时的同机方案 |
 | `mysql` | ~50ms+ | ✅ | DBUtils + 驱动 | 兼容兜底（Redis/ZMQ 都不可用时）|
-| `shm` | — | ❌ | — | 留接口未实现（需 Python 3.8+）|
 
 切换传输**只改一个配置字段 `transport`**，业务代码（handlers / `to_jsonable` / `process_request`）零改动。
 
@@ -56,7 +55,7 @@
 
 ```python
 BIGQMT_REDIS_CONFIG = {
-    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql/shm
+    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql
     "zmq": {
         "bind_address": "tcp://127.0.0.1:5560",  # Windows 同机使用 TCP 回环
     },
@@ -120,8 +119,10 @@ BIGQMT_REDIS_CONFIG = {
 - 用 ZMQ 原生 identity 路由（`reply_*` 字段忽略）
 - Windows 用 `tcp://127.0.0.1:port`（ZMQ 在 Windows 不支持 `ipc://`）
 - Linux 同机可用 `ipc://` 更快（绕过 TCP 栈）
-- 实测同机 tcp 回环：**p50 = 0.2ms**（比 Redis 快 ~60 倍）；
-  在大 QMT 全终端进程内实测 ping **p50 ≈ 0.3ms**（20 次 0 个 >50ms）。
+- 裸 socket 层同机 tcp 回环 p50 = 0.2ms，但那不是 RPC 往返：请求还要被 QMT 的
+  python 线程取走、处理、发回。在大 QMT 全终端进程内实测 ping **p50 = 95ms**
+  （drain 模式，等于一个 adjust tick），后台线程模式是 **405ms**。同一台终端上
+  redis 是 **10ms** —— 早期文档里的 0.2ms / 0.3ms 是最好情况，不是 p50。
 
 注意：ZMQ transport 的 `stop()` 由 ROUTER 接收线程自己关闭 socket（Windows
 上跨线程 close socket 会触发 signaler 断言）。
@@ -158,11 +159,6 @@ BIGQMT_REDIS_CONFIG = {
 
 注意：sqlite 连接线程绑定，sqlite 测试需 `check_same_thread=False` + `maxshared=0`。
 
-### SHM（`transport: shm`，未实现）
-
-留接口，`send_request` 会抛 `TransportError`。Python 3.8+ 的
-`multiprocessing.shared_memory` 或自定义 mmap 环形缓冲区可后续实现。
-
 ## 实测延迟对比（同机）
 
 基准脚本：`python bench_transports.py -n 100`
@@ -192,7 +188,6 @@ src/bigqmt_signal_trader/transports/
 ├── redis_transport.py     # Redis 实现（默认，零行为变更）
 ├── zmq_transport.py       # ZMQ ROUTER/DEALER 实现
 ├── mysql_transport.py     # MySQL + DBUtils 连接池
-├── shm_transport.py       # 共享内存 stub
 └── factory.py             # build_transport(name, config) 工厂
 ```
 

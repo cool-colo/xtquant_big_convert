@@ -6,7 +6,14 @@ from typing import Dict, List
 try:
     from typing import Protocol
 except ImportError:  # pragma: no cover
-    from typing_extensions import Protocol
+    try:
+        from typing_extensions import Protocol
+    except ImportError:
+        # Very old embedded environments (QMT built-in Python 3.6 without
+        # typing_extensions): Protocol is only used for structural typing
+        # documentation here, so a plain stand-in keeps imports working.
+        class Protocol(object):
+            pass
 
 from .models import (
     AccountSnapshot,

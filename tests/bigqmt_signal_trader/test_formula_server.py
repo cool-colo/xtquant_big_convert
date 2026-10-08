@@ -111,18 +111,22 @@ class ParamTranslationTest(unittest.TestCase):
         client = FakeClient(responses=responses, error=error)
         return fs.FormulaServerRouter(client=client), client
 
-    def test_instrument_aliases_the_misspelled_volume_fields(self):
-        """FormulaServer ships FloatVolumn/TotalVolumn; the xtdata SDK spells
-        them FloatVolume/TotalVolume. Downstream reads the SDK spelling."""
-        router, _ = self._router(
+    def test_instrument_detail_is_not_routed_here_anymore(self):
+        """#392: FormulaServer's getInstrumentDetail answers TotalVolume /
+        OpenDate with zeros or stale snapshots on the Guojin build (43% / 32%
+        of a 300-code sample zero, 22% non-zero-but-stale), while the bridge's
+        ContextInfo path answered every code correctly. A well-formed wrong
+        answer is worse than no answer, so the three instrument methods were
+        taken out of METHOD_MAP -- they must be Unroutable here and fall back
+        to the RPC bridge."""
+        router, client = self._router(
             {"getInstrumentDetail": {"result": {"FloatVolumn": 1.0, "TotalVolumn": 2.0}}}
         )
 
-        out = router.call("get_instrument", {"code": "000001.SZ"})
-
-        self.assertEqual(out["FloatVolume"], 1.0)
-        self.assertEqual(out["TotalVolume"], 2.0)
-        self.assertEqual(out["FloatVolumn"], 1.0)  # raw key still present
+        for method in ("get_instrument", "get_instrument_detail", "get_instrumentdetail"):
+            with self.assertRaises(fs.Unroutable):
+                router.call(method, {"code": "000001.SZ"})
+        self.assertEqual(client.calls, [])
 
     def test_sector_normalizes_the_minus_one_sentinel(self):
         router, client = self._router({"getStockListInSector": {"result": ["600000.SH"]}})
@@ -147,6 +151,31 @@ class ParamTranslationTest(unittest.TestCase):
                     },
                 )
         self.assertEqual(client.calls, [])
+
+    def test_market_data_refuses_non_bar_periods(self):
+        """Non-bar periods must not go through the fastpath: a period='tick'
+        getMarketData request wedged the whole FormulaServer behind the shared
+        socket lock (drip-fed response, no timeout) on 2026-08-30, taking every
+        fastpath read with it. Refuse and let RPC answer."""
+        router, client = self._router({"getMarketData": {"result": []}})
+
+        for period in ("tick", "l2quote", "l2order"):
+            with self.assertRaises(fs.Unroutable):
+                router.call(
+                    "get_market_data_ex",
+                    {"field_list": ["close"], "stock_list": ["000001.SZ"], "period": period},
+                )
+        self.assertEqual(client.calls, [])
+
+    def test_market_data_allows_bar_periods(self):
+        router, client = self._router({"getMarketData": {"result": []}})
+
+        router.call(
+            "get_market_data_ex",
+            {"field_list": ["close"], "stock_list": ["000001.SZ"], "period": "5m"},
+        )
+
+        self.assertEqual(client.calls[0][1]["period"], "5m")
 
     def test_market_data_allows_unadjusted(self):
         router, client = self._router({"getMarketData": {"result": []}})
@@ -226,7 +255,7 @@ class ParamTranslationTest(unittest.TestCase):
         router, client = self._router()
 
         with self.assertRaises(fs.Unroutable):
-            router.call("get_instrument", {})
+            router.call("get_total_share", {})
         self.assertEqual(client.calls, [])
 
 
@@ -237,6 +266,14 @@ class FallbackBehaviourTest(unittest.TestCase):
         self.assertFalse(router.supports("get_asset"))
         self.assertFalse(router.supports("submit_order"))
         self.assertFalse(router.supports("get_full_tick"))
+
+    def test_instrument_methods_stay_on_rpc(self):
+        """#392: dishonest TotalVolume / OpenDate from getInstrumentDetail."""
+        router = fs.FormulaServerRouter(client=FakeClient())
+
+        self.assertFalse(router.supports("get_instrument"))
+        self.assertFalse(router.supports("get_instrument_detail"))
+        self.assertFalse(router.supports("get_instrumentdetail"))
 
     def test_trading_dates_and_dividends_stay_on_rpc(self):
         """Their FormulaServer params mean something different from ours."""

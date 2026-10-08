@@ -983,6 +983,27 @@ get_sector_list('我的')                             # -> [['我的自选', ...
 reset_sector_stock_list('我的自选', ['000001.SZ', '600000.SH'])
 ```
 
+> **实测：这一族在 2.1.19.0 终端上一个都调不通**（issue #143，2026-09-02）。
+> 三条通道全部枚举过（`probe_capabilities` 的 `sector_probe` 块）：
+>
+> | | 有什么 |
+> |---|---|
+> | `ContextInfo` | `create_sector`、`get_sector`、`get_stock_list_in_sector` |
+> | QMT 注入的全局函数 | **一个都没有** |
+> | 原生 xtdata SDK | `add_sector`、`remove_sector`、`get_sector_list`、`get_stock_list_in_sector`、`download_sector_data` |
+>
+> 也就是说：上表六个里，`create_sector_folder` / `reset_sector_stock_list` /
+> `add_stock_to_sector` / `remove_stock_from_sector` **在三条通道上都不存在**；
+> `create_sector` 只在 `ContextInfo` 上有，而且签名是 `(sector_name, stock_list)`
+> 两参数，**调用后返回 None、什么都不做**（板块数量前后都是 13）。
+> 原生 SDK 的 `add_sector` / `remove_sector` 存在，但在大 QMT 进程内
+> `无法连接行情服务！`。
+>
+> 本仓库据此把这一族按 `add_sector(name, stock_list)` 的形状实现（读-合并-写），
+> 并在**每次写入后回读校验**，写不进去就抛错 —— 而不是沿用上表那个在本终端
+> 不存在的三参数签名。`get_sector_list` 同理：拿不到真实板块时抛错，
+> `allow_fallback=True` 才返回那 13 个常用名。
+
 ---
 
 ## 5. 行情函数

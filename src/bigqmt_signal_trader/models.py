@@ -191,6 +191,102 @@ class PositionSnapshot:
         self.direction = direction
 
 
+class PositionStatisticsSnapshot:
+    """One position-statistics row, i.e. ``get_trade_detail_data(..., "POSITION_STATISTICS")``.
+
+    """
+
+    def __init__(
+        self,
+        account_id="",
+        exchange_id="",
+        exchange_name="",
+        product_id="",
+        instrument_id="",
+        instrument_name="",
+        stock_code="",
+        direction=0,
+        hedge_flag=0,
+        position=0,
+        yesterday_position=0,
+        today_position=0,
+        can_close_vol=0,
+        position_cost=None,
+        avg_price=None,
+        position_profit=None,
+        float_profit=None,
+        open_price=None,
+        used_margin=None,
+        used_commission=None,
+        frozen_margin=None,
+        frozen_commission=None,
+        instrument_value=None,
+        open_times=0,
+        open_volume=0,
+        cancel_times=0,
+        last_price=None,
+        rise_ratio=None,
+        product_name="",
+        royalty=None,
+        expire_date="",
+        assest_weight=None,
+        increase_by_settlement=None,
+        margin_ratio=None,
+        float_profit_divide_by_used_margin=None,
+        float_profit_divide_by_balance=None,
+        today_profit_loss=None,
+        yesterday_init_position=0,
+        frozen_royalty=None,
+        today_close_profit_loss=None,
+        close_profit=None,
+        ft_product_name="",
+        open_cost=None,
+    ):
+        self.account_id = account_id
+        self.exchange_id = exchange_id
+        self.exchange_name = exchange_name
+        self.product_id = product_id
+        self.instrument_id = instrument_id
+        self.instrument_name = instrument_name
+        self.stock_code = stock_code
+        self.direction = direction
+        self.hedge_flag = hedge_flag
+        self.position = position
+        self.yesterday_position = yesterday_position
+        self.today_position = today_position
+        self.can_close_vol = can_close_vol
+        self.position_cost = position_cost
+        self.avg_price = avg_price
+        self.position_profit = position_profit
+        self.float_profit = float_profit
+        self.open_price = open_price
+        self.used_margin = used_margin
+        self.used_commission = used_commission
+        self.frozen_margin = frozen_margin
+        self.frozen_commission = frozen_commission
+        self.instrument_value = instrument_value
+        self.open_times = open_times
+        self.open_volume = open_volume
+        self.cancel_times = cancel_times
+        self.last_price = last_price
+        self.rise_ratio = rise_ratio
+        self.product_name = product_name
+        self.royalty = royalty
+        self.expire_date = expire_date
+        self.assest_weight = assest_weight
+        self.increase_by_settlement = increase_by_settlement
+        self.margin_ratio = margin_ratio
+        self.float_profit_divide_by_used_margin = float_profit_divide_by_used_margin
+        self.float_profit_divide_by_balance = float_profit_divide_by_balance
+        self.today_profit_loss = today_profit_loss
+        self.yesterday_init_position = yesterday_init_position
+        self.frozen_royalty = frozen_royalty
+        self.today_close_profit_loss = today_close_profit_loss
+        self.close_profit = close_profit
+        self.ft_product_name = ft_product_name
+        self.open_cost = open_cost
+
+
 class AssetSnapshot:
     """Account funds, mirroring MiniQMT's ``XtAsset``.
 
@@ -204,9 +300,11 @@ class AssetSnapshot:
     and None means "the terminal did not report it" — distinct from 0.0.
     """
 
-    def __init__(self, account_id, cash=None, total_asset=None, frozen_cash=None, market_value=None):
+    def __init__(self, account_id, cash=None, total_asset=None, frozen_cash=None, market_value=None, fetch_balance=None):
         self.account_id = account_id
         self.cash = cash
+        # Withdrawable funds; None means unreported, not zero or available cash.
+        self.fetch_balance = fetch_balance
         self.total_asset = total_asset
         self.frozen_cash = frozen_cash
         self.market_value = market_value
@@ -233,7 +331,17 @@ class OrderRequest:
         price_type,
         strategy_name,
         remark="",
+        order_type=None,
+        account_type=None,
     ):
+        # MiniQMT-style order_type (xtconstant). Only set for operations a
+        # BUY/SELL action cannot express -- credit financing, repayment and the
+        # special-margin family. None means an ordinary stock order.
+        self.order_type = order_type
+        # The account type the request named (港股通: "HUGANGTONG" on a stock
+        # account id). The settlement lookup reads the order back under it;
+        # None means the account's default.
+        self.account_type = account_type
         self.signal_id = signal_id
         self.account_id = account_id
         self.action = action
@@ -268,6 +376,17 @@ class OrderSnapshot:
         remark="",
         order_time=0,
         status_msg="",
+        traded_price=0.0,
+        price_type=None,
+        account_type=0,
+        instrument_name="",
+        secu_account="",
+        offset_flag=None,
+        direction=None,
+        trade_amount=0.0,
+        op_type=None,
+        entrust_type=None,
+        opt_name="",
         order_at="",
     ):
         self.order_sys_id = order_sys_id
@@ -278,6 +397,20 @@ class OrderSnapshot:
         self.traded_volume = traded_volume
         self.status = status
         self.price = price
+        self.traded_price = traded_price
+        # The terminal's own m_nOpType (27 融资买入, 31 卖券还款, ...). BUY/SELL
+        # above is derived from it for bookkeeping; the client needs the
+        # original to report a credit order as its MiniQMT order_type instead
+        # of plain 23/24 (#330).
+        self.op_type = op_type
+        # 官方 ORDER 字段 m_eEntrustType（EEntrustTypes 委托类别：54 融资 /
+        # 55 融券 / 56 信用平仓 / 57 信用普通）。信用委托真正的判别字段——
+        # reporter 实盘数据证实 m_nOpType 分不出融资买入和担保品买入，
+        # m_eEntrustType 分得清（#330 跟修）。0.3.52 之前的服务端没有它。
+        self.entrust_type = entrust_type
+        # 官方 ORDER 字段 m_strOptName（直接给「融资买入」「担保品买入」的
+        # 名称），目前只用来识别「专项」。
+        self.opt_name = opt_name
         self.strategy_name = strategy_name
         self.remark = remark
         # 报单时间, Unix 秒 -- MiniQMT XtOrder.order_time 的语义。0 = 未上报。
@@ -287,6 +420,22 @@ class OrderSnapshot:
         # 柜台的拒单理由只在这里, 例如
         # "[COUNTER] 资金可用余额不足，尚需[4789.630]" (issue #60)。
         self.status_msg = status_msg
+        # 完整 QMT 的不同版本可能不提供 price_type；追加在末尾保持旧位置参数兼容。
+        self.price_type = price_type
+        # 下面这五个是 MiniQMT XtOrder 契约里有、本桥一直没发的字段
+        # (issue #133)。xttype.XtOrder 的构造参数就列着 secu_account /
+        # instrument_name，并在 __init__ 里置 account_type。
+        # account_type 是 xtconstant 的数字码（0 = 未知，由客户端兜底）。
+        self.account_type = account_type
+        self.instrument_name = instrument_name
+        self.secu_account = secu_account
+        self.offset_flag = offset_flag
+        self.direction = direction
+        # 官方 Order 字段 m_dTradeAmount(成交金额; 期货 = 均价×数量×合约乘数)。
+        # 柜台自己给的成交金额, 不用调用方拿价格乘数量去算 (issue #173)。
+        # 追加在末尾并给默认值, 保持既有位置参数调用不受影响。
+        # 0.0 = 未成交, 或该终端的 ORDER 行不带这个字段。
+        self.trade_amount = trade_amount
         # QMT-recorded委托时间 ("YYYY-MM-DD HH:MM:SS"); serialized via __dict__.
         self.order_at = order_at
 
@@ -294,7 +443,9 @@ class OrderSnapshot:
 class TradeSnapshot:
     def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price,
                  traded_at="", user_order_id="", amount=0.0, strategy_name="",
-                 traded_time=0, commission=None):
+                 traded_time=0, account_type=0, instrument_name="",
+                 secu_account="", commission=0.0, offset_flag=None,
+                 direction=None, op_type=None, entrust_type=None, opt_name=""):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -306,12 +457,24 @@ class TradeSnapshot:
         # 官方 Deal 字段 m_dTradeAmount(成交额) / m_strTradeDate+m_strTradeTime。
         # 追加在末尾并给默认值, 保持既有位置参数调用不受影响 (同 OrderSnapshot.order_time)。
         self.amount = amount
-        # strategy_name 是查询过滤参数 (仅委托/成交有效): 按策略过滤时返回集
-        # 必属该策略, 因此直接回填; 空策略名查全部时保持 ""。
+        # strategy_name 优先取 DEAL 行自己的 m_strStrategyName；取不到才回填查询
+        # 过滤参数（按策略过滤时返回集必属该策略）。以前只有后一半，
+        # 所以不过滤查全部时这个字段恒为空字符串 (issue #133)。
         self.strategy_name = strategy_name
         self.traded_time = traded_time
-        # 手续费 (commission fee); QMT deal field m_dCommission (legacy m_dComssion/m_dComission).
+        self.traded_time = traded_time
+        # 同 OrderSnapshot：MiniQMT XtTrade 契约里有而本桥没发的字段。
+        # commission 是 XtTrade 独有的（手续费）。
+        self.account_type = account_type
+        self.instrument_name = instrument_name
+        self.secu_account = secu_account
         self.commission = commission
+        self.offset_flag = offset_flag
+        self.direction = direction
+        self.op_type = op_type
+        # 同 OrderSnapshot：m_eEntrustType 是信用委托的可靠判别字段（#330）。
+        self.entrust_type = entrust_type
+        self.opt_name = opt_name
 
 
 class OrderRef:

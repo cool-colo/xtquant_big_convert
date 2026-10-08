@@ -32,10 +32,12 @@ def _time_axis(df):
     otherwise a MiniQMT-shaped write silently disables date filtering, so
     get_local_data returns every cached day regardless of the window
     (issue #54 follow-up).
+
+    A MiniQMT-compatible frame can also have *both* a date-shaped index and an
+    epoch-ms ``time`` column.  Prefer the index in that case: parquet must keep
+    it, and date-window comparisons must not compare ``20260818`` with
+    ``1786982400000`` as strings.
     """
-    name = _time_col(df)
-    if name:
-        return name, False
     index = getattr(df, "index", None)
     try:
         if index is not None and len(index):
@@ -44,12 +46,24 @@ def _time_axis(df):
                 return "__index__", True
     except Exception:
         pass
+    name = _time_col(df)
+    if name:
+        return name, False
     return None, False
 
 
 def _pad_end(value):
     text = str(value)
     return text + "9" * (14 - len(text)) if 0 < len(text) < 14 else text
+
+
+def _align_start(value, sample):
+    """Align a timestamp lower bound to an eight-digit daily cache axis."""
+    text = str(value)
+    sample_text = str(sample)
+    if sample_text.isdigit() and len(sample_text) == 8 and text.isdigit() and len(text) > 8:
+        return text[:8]
+    return text
 
 
 def _drop_placeholder_rows(df):
@@ -206,7 +220,8 @@ class LocalMarketCache:
             # 复用旧 mask 会长度不匹配（索引形态直接报错）。
             if start_time:
                 series = df.index.astype(str) if on_index else df[axis].astype(str)
-                df = df[series >= str(start_time)]
+                start_bound = _align_start(start_time, next(iter(series))) if len(series) else str(start_time)
+                df = df[series >= start_bound]
             if end_time:
                 series = df.index.astype(str) if on_index else df[axis].astype(str)
                 df = df[series <= _pad_end(end_time)]

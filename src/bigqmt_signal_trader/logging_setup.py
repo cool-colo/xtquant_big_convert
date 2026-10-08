@@ -24,11 +24,19 @@ Behavior:
 """
 
 import datetime as _dt
-import logging
-import logging.handlers
 import os
 import sys
 import time
+import traceback
+
+try:
+    import logging
+    import logging.handlers
+except ImportError:
+    # Some broker QMT Python bundles omit logging from python36.zip.  The
+    # bridge still needs a minimal file/stdout logger to start and report why
+    # later operations fail.
+    logging = None
 
 _LOGGER_NAME = "bigqmt"
 _initialized = False
@@ -72,14 +80,61 @@ def _resolve_log_dir():
     return None
 
 
-class _SafeStreamHandler(logging.Handler):
-    """print() the record so the QMT output panel shows it; never raises."""
+if logging is not None:
+    class _SafeStreamHandler(logging.Handler):
+        """print() the record so the QMT output panel shows it; never raises."""
 
-    def emit(self, record):
+        def emit(self, record):
+            try:
+                print(self.format(record))
+            except Exception:
+                pass
+
+
+class _FallbackLogger:
+    """Small logger used only when the broker Python omits stdlib logging."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def _write(self, level, message, args, exception_text=None):
         try:
-            print(self.format(record))
+            rendered = str(message) % args if args else str(message)
         except Exception:
-            pass
+            rendered = "%s %s" % (message, args)
+        if exception_text:
+            rendered = "%s\n%s" % (rendered, exception_text)
+        line = "%s [%s] [%s] %s" % (
+            _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, self.name, rendered,
+        )
+        if _env_bool("BIGQMT_LOG_ENABLED", True):
+            log_dir = _resolve_log_dir()
+            if log_dir is not None:
+                try:
+                    with open(os.path.join(log_dir, "bigqmt.log"), "a") as log_file:
+                        log_file.write(line + "\n")
+                except Exception:
+                    pass
+        if _env_bool("BIGQMT_LOG_TO_STDOUT", True):
+            try:
+                print(line)
+            except Exception:
+                pass
+
+    def debug(self, message, *args):
+        self._write("DEBUG", message, args)
+
+    def info(self, message, *args):
+        self._write("INFO", message, args)
+
+    def warning(self, message, *args):
+        self._write("WARNING", message, args)
+
+    def error(self, message, *args):
+        self._write("ERROR", message, args)
+
+    def exception(self, message, *args):
+        self._write("ERROR", message, args, traceback.format_exc())
 
 
 def _cleanup_old_logs(log_dir, retention_days):
@@ -103,12 +158,88 @@ def _cleanup_old_logs(log_dir, retention_days):
         pass
 
 
+def _detach_existing_handlers(logger):
+    """Drop and CLOSE whatever a previous run left on this logger (issue #139).
+
+    Idempotence cannot live in a module global here. The entry purges every
+    bigqmt_signal_trader module from sys.modules on each start
+    (_clear_local_modules, and reload_deployment does the same), so
+    _initialized is back to False on the next import -- while
+    logging.getLogger("bigqmt") lives in the logging module's own registry,
+    which is never purged. The module state resets, the logger does not, so
+    _setup() kept appending: after a day of restarts one log line was written
+    to bigqmt.log SIXTEEN times.
+
+    close() is the half that is easy to miss. Removing a handler without
+    closing it leaves the file handle open, and TimedRotatingFileHandler then
+    cannot rename its own file:
+
+        PermissionError: [WinError 32] ... 'bigqmt.log' -> 'bigqmt.log.2026-08-31'
+
+    which fired on every log write, and meant rotation never succeeded -- so
+    backupCount pruning never ran and BIGQMT_LOG_RETENTION_DAYS did nothing.
+    """
+    for handler in list(getattr(logger, "handlers", [])):
+        try:
+            logger.removeHandler(handler)
+        except Exception:
+            pass
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
+def _log_file_name():
+    """Log file name, scoped so two processes never share one file (#139/#144).
+
+    A user running two bridges at once -- one live account, one simulated --
+    got both clients writing the same ~/.cache/bigqmt/logs/bigqmt.log. Two OS
+    handles on one file means TimedRotatingFileHandler can never rename it on
+    Windows:
+
+        PermissionError: [WinError 32] ... 'bigqmt.log' -> 'bigqmt.log.2026-09-01'
+
+    raised on every write, and rotation never succeeding means backupCount
+    pruning never runs either. No amount of in-process handler bookkeeping
+    fixes that -- the other handle belongs to another process.
+
+    Account id first: it is stable across restarts, so a bridge keeps writing
+    the same file and rotation still has something to roll. PID otherwise.
+    BIGQMT_LOG_NAME pins it explicitly for anyone who wants the old behaviour.
+    """
+    explicit = str(os.environ.get("BIGQMT_LOG_NAME") or "").strip()
+    if explicit:
+        return explicit
+    account = str(os.environ.get("BIGQMT_ACCOUNT_ID") or "").strip()
+    tag = "".join(ch for ch in account if ch.isalnum()) or ("pid%d" % os.getpid())
+    return "bigqmt-%s.log" % tag
+
+
+def _tolerant_rotator(source, dest):
+    """Rename for rotation, but never raise if the file is held.
+
+    Belt and braces next to _log_file_name: someone pinning BIGQMT_LOG_NAME
+    across two processes is back to a shared file, and a failed rename must not
+    turn every subsequent log write into a traceback in the QMT panel. Losing
+    one rotation is a smaller problem than losing the log's readability.
+    """
+    try:
+        if os.path.exists(source):
+            os.replace(source, dest)
+    except Exception:
+        pass
+
+
 def _setup():
     global _initialized
     if _initialized:
         return
     _initialized = True
+    if logging is None:
+        return
     logger = logging.getLogger(_LOGGER_NAME)
+    _detach_existing_handlers(logger)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     if not _env_bool("BIGQMT_LOG_ENABLED", True):
@@ -124,7 +255,7 @@ def _setup():
     log_dir = _resolve_log_dir()
     if log_dir is not None:
         try:
-            fname = os.path.join(log_dir, "bigqmt.log")
+            fname = os.path.join(log_dir, _log_file_name())
             file_handler = logging.handlers.TimedRotatingFileHandler(
                 fname,
                 when="midnight",
@@ -133,6 +264,7 @@ def _setup():
                 encoding="utf-8",
                 utc=False,
             )
+            file_handler.rotator = _tolerant_rotator
             file_handler.setFormatter(fmt)
             logger.addHandler(file_handler)
             _cleanup_old_logs(log_dir, int(os.environ.get("BIGQMT_LOG_RETENTION_DAYS", 7)))
@@ -159,6 +291,8 @@ def get_logger(name=""):
     _setup()
     suffix = str(name or "").strip(".")
     full = _LOGGER_NAME if not suffix else "%s.%s" % (_LOGGER_NAME, suffix)
+    if logging is None:
+        return _FallbackLogger(full)
     return logging.getLogger(full)
 
 

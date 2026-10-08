@@ -25,12 +25,10 @@ import time
 # Add src to path so bigqmt_signal_trader resolves when run from repo root.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-import redis
-
 from bigqmt_signal_trader.redis_rpc import call_redis_rpc
 
 
-def _load_account_and_redis():
+def _load_config():
     cfg = {}
     try:
         import bigqmt_signal_trader_local_config as _c  # noqa
@@ -48,10 +46,59 @@ def _load_account_and_redis():
     )
     if not redis_cfg["password"]:
         redis_cfg.pop("password")
-    return str(account), redis_cfg
+    transport = str(
+        os.environ.get("BIGQMT_RPC_TRANSPORT") or cfg.get("transport") or "redis"
+    ).lower()
+    zmq_cfg = dict(cfg.get("zmq") or {})
+    return str(account), redis_cfg, transport, zmq_cfg
 
 
-ACCOUNT, REDIS = _load_account_and_redis()
+ACCOUNT, REDIS, TRANSPORT, ZMQ_CFG = _load_config()
+
+
+def _build_caller():
+    """Build the one caller every test goes through: (method, params, timeout).
+
+    This used to always talk call_redis_rpc -- under a zmq deployment the
+    ping timed out and every test after it failed, while the bridge itself
+    was fine (issue #157, @simonfantasy). Follows the configured transport
+    now; the zmq envelope matches what the client library's call() sends.
+    redis-py is only needed on the redis path, so NO_REDIS_FLAT deployments
+    (no redis client lib at all) can run this script too.
+    """
+    if TRANSPORT == "zmq":
+        import uuid as _uuid
+
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        zt = ZmqTransport(
+            account_id=ACCOUNT,
+            connect_address=ZMQ_CFG.get("connect_address") or ZMQ_CFG.get("bind_address"),
+            host=ZMQ_CFG.get("host"),
+            port=int(ZMQ_CFG["port"]) if ZMQ_CFG.get("port") else None,
+        )
+
+        def call(method, params, timeout):
+            request = {
+                "schema_version": 1,
+                "request_id": _uuid.uuid4().hex,
+                "account_id": ACCOUNT,
+                "method": method,
+                "params": params or {},
+                "ttl_seconds": 60,
+            }
+            return zt.send_request(request, timeout)
+
+        return call
+
+    import redis
+
+    r = redis.Redis(**REDIS)
+
+    def call(method, params, timeout):
+        return call_redis_rpc(r, ACCOUNT, method, params, timeout_seconds=timeout)
+
+    return call
 # account_id placeholder filled in main() once ACCOUNT is confirmed.
 _ACCT_PARAM = {"account_id": None}
 
@@ -110,11 +157,11 @@ def _is_empty(data):
     return data is None or data == {} or data == [] or data == ""
 
 
-def _call(r, method, params, timeout=12):
+def _call(caller, method, params, timeout=12):
     """Call and return (response, latency_ms, error_str)."""
     t0 = time.time()
     try:
-        resp = call_redis_rpc(r, ACCOUNT, method, params, timeout_seconds=timeout)
+        resp = caller(method, params, timeout)
         return resp, (time.time() - t0) * 1000, None
     except Exception as e:
         return None, (time.time() - t0) * 1000, str(e)
@@ -128,38 +175,31 @@ def main():
         if "account_id" in params and params["account_id"] is None:
             params["account_id"] = ACCOUNT
 
-    r = redis.Redis(**REDIS)
+    caller = _build_caller()
 
     print("=" * 90)
-    print("全量 API 测试 (account=%s) — 端到端验证" % ACCOUNT)
+    print("全量 API 测试 (account=%s, transport=%s) — 端到端验证" % (ACCOUNT, TRANSPORT))
     print("=" * 90)
 
     # === 端到端验证 0: 客户端/服务端 transport 一致性 ===
     print("\n--- 端到端验证: 客户端/服务端一致性 ---")
-    # 检测客户端配置里的 transport
-    client_transport = "redis"  # 默认
-    try:
-        import bigqmt_signal_trader_local_config as _c
-        client_transport = str(getattr(_c, "BIGQMT_REDIS_CONFIG", {}).get("transport", "redis")).lower()
-    except Exception:
-        pass
-    print("客户端配置 transport: %s" % client_transport)
+    print("客户端配置 transport: %s（本脚本跟随该配置发请求）" % TRANSPORT)
 
-    # 如果客户端是 zmq 但服务端不是, ping 会超时
-    ping_resp, ping_ms, ping_err = _call(r, "ping", {}, timeout=8)
+    ping_resp, ping_ms, ping_err = _call(caller, "ping", {}, timeout=8)
     if ping_err:
         print("❌ ping 失败: %s" % ping_err)
         if "timeout" in ping_err.lower():
             print("   可能原因: 客户端 transport 和服务端不匹配")
-            print("   - 客户端配置 transport=%s" % client_transport)
+            print("   - 客户端配置 transport=%s" % TRANSPORT)
             print("   - 如果服务端是 zmq, 客户端也要设 transport=zmq")
             print("   - 如果服务端是 redis, 客户端保持 redis 即可")
+            print("   - zmq 下检查 BIGQMT_REDIS_CONFIG.zmq.connect_address 是否指向服务端绑定地址")
         return
-    print("✅ ping OK (%.0fms) — 客户端/服务端连通" % ping_ms)
+    print("✅ ping OK (%.0fms) — 客户端/服务端连通 (%s)" % (ping_ms, TRANSPORT.upper()))
 
     # === 端到端验证 2: 账户有持仓时 get_positions 必须返回非空 ===
     print("\n--- 端到端验证: 持仓查询 ---")
-    pos_resp, pos_ms, pos_err = _call(r, "get_positions", {}, timeout=12)
+    pos_resp, pos_ms, pos_err = _call(caller, "get_positions", {}, timeout=12)
     if pos_err:
         print("❌ get_positions 失败: %s" % pos_err)
     elif not pos_resp.get("ok"):
@@ -173,7 +213,7 @@ def main():
 
     # === 端到端验证 3: query_orders 验证 (strategy_name 陷阱) ===
     print("\n--- 端到端验证: 委托查询 ---")
-    ord_resp, ord_ms, ord_err = _call(r, "query_orders", {}, timeout=12)
+    ord_resp, ord_ms, ord_err = _call(caller, "query_orders", {}, timeout=12)
     if ord_err:
         print("❌ query_orders 失败: %s" % ord_err)
     elif not ord_resp.get("ok"):
@@ -189,7 +229,7 @@ def main():
     print("\n--- 端到端验证: 买入/卖出 (仅交易时段) ---")
     # 用极低价格买入 (确保不成交), 然后查委托确认进了系统
     # 先拿一只股票的现价
-    tick_resp, _, tick_err = _call(r, "get_full_tick", {"codes": ["600654.SH"]}, timeout=12)
+    tick_resp, _, tick_err = _call(caller, "get_full_tick", {"codes": ["600654.SH"]}, timeout=12)
     if tick_err or not tick_resp.get("ok"):
         print("⚠️  跳过买入测试 (get_full_tick 失败: %s)" % (tick_err or tick_resp.get("error")))
     else:
@@ -199,11 +239,11 @@ def main():
         print("  用 600654.SH @%.2f 买入 100 股 (跌停价, 不成交)" % buy_price)
 
         # 下单前委托数
-        ord_before, _, _ = _call(r, "query_orders", {}, timeout=12)
+        ord_before, _, _ = _call(caller, "query_orders", {}, timeout=12)
         before_count = len((ord_before or {}).get("data") or []) if ord_before else 0
 
         # 下单
-        sub_resp, sub_ms, sub_err = _call(r, "submit_order", {
+        sub_resp, sub_ms, sub_err = _call(caller, "submit_order", {
             "stock_code": "600654.SH", "action": "BUY", "volume": 100,
             "price": buy_price, "price_type": "LIMIT", "strategy_name": "rpc_test",
             "signal_id": "e2e-test-%d" % int(time.time()),
@@ -220,7 +260,7 @@ def main():
 
             # 等 1s 让 QMT 处理, 然后查委托确认进了系统
             time.sleep(1)
-            ord_after, _, _ = _call(r, "query_orders", {}, timeout=12)
+            ord_after, _, _ = _call(caller, "query_orders", {}, timeout=12)
             after_orders = (ord_after or {}).get("data") or [] if ord_after else []
             found = any(
                 str(o.get("stock_code") or "").upper() == "600654.SH"
@@ -239,7 +279,7 @@ def main():
                         oid = str(o.get("order_sys_id") or "")
                         break
                 if oid:
-                    cancel_resp, cancel_ms, cancel_err = _call(r, "cancel_order", {
+                    cancel_resp, cancel_ms, cancel_err = _call(caller, "cancel_order", {
                         "order_sys_id": oid, "market": "SH"
                     }, timeout=15)
                     if cancel_err:
@@ -262,7 +302,7 @@ def main():
 
     results = {"ok": [], "ok_empty": [], "fail": [], "timeout": []}
     for method, params, label in TESTS:
-        resp, dt, err = _call(r, method, params, timeout=12)
+        resp, dt, err = _call(caller, method, params, timeout=12)
         if err:
             is_timeout = "timeout" in err.lower()
             bucket = "timeout" if is_timeout else "fail"

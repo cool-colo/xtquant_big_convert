@@ -3,7 +3,7 @@
 Covers the MiniQMT-facing contract on the bridge side:
 
 - trade objects carry traded_id / traded_time / traded_amount / strategy_name
-- order objects carry a real order_time (server sends created_at_ts only)
+- order objects carry traded_price and a real order_time (server sends created_at_ts only)
 - order-error objects carry order_remark (best effort)
 - cancel-error objects carry order_id on the local-exception path too
 - cancel responses carry cancel_result / error_msg (MiniQMT semantics)
@@ -139,6 +139,16 @@ class TradeObjectContractTest(unittest.TestCase):
         order = trader._order_from_dict("acct", {"created_at_ts": 1755655200.0})
         self.assertEqual(order.order_time, 1755655200)
 
+    def test_order_object_provides_traded_price_without_overloading_limit_price(self):
+        trader = self._trader()
+        order = trader._order_from_dict(
+            "acct",
+            {"price": 10.1, "traded_price": 10.05, "traded_volume": 100},
+        )
+        self.assertEqual(order.price, 10.1)
+        self.assertEqual(order.traded_price, 10.05)
+        self.assertEqual(order.traded_volume, 100)
+
 
 class CallbackContractTest(unittest.TestCase):
     def _trader(self, callback, client=None):
@@ -178,30 +188,76 @@ class CallbackContractTest(unittest.TestCase):
         self.assertEqual(len(cb.order_errors), 1)
         self.assertEqual(cb.order_errors[0].order_remark, "")
 
+    def test_order_error_order_id_is_the_int_wrapper_not_the_raw_str(self):
+        """#363: the error callback used to hand over the raw broker string
+        ('xt1082186097') as order_id, where every other path -- on_stock_order,
+        order_stock's return -- carries the OrderId int subclass. The caller
+        could neither correlate the error with the submit's id nor cancel with
+        it. int now, str() still round-trips the broker string."""
+        cb = _RecordingCallback()
+        trader = self._trader(cb)
+        trader._deliver_event(
+            {
+                "event_type": "order_error",
+                "account_id": "acct",
+                "order_sys_id": "xt1082186097",
+                "error_id": 2147483647,
+                "error_msg": "[COUNTER] 可用资金不足",
+            }
+        )
+        self.assertEqual(len(cb.order_errors), 1)
+        err = cb.order_errors[0]
+        self.assertIsInstance(err.order_id, int)
+        self.assertEqual(str(err.order_id), "xt1082186097")
+        self.assertEqual(err.order_sysid, "xt1082186097")
+        # Same surrogate int the submit path hands back for this sysid.
+        self.assertEqual(err.order_id, trader._order_object_id("xt1082186097"))
+
+    def test_cancel_error_order_id_is_the_int_wrapper_too(self):
+        """#363's twin: cancel_error had the same raw-str order_id."""
+        cb = _RecordingCallback()
+        trader = self._trader(cb)
+        trader._deliver_event(
+            {
+                "event_type": "cancel_error",
+                "account_id": "acct",
+                "order_sys_id": "xt1082186097",
+                "error_id": -1,
+                "error_msg": "cancel rejected",
+            }
+        )
+        self.assertEqual(len(cb.cancel_errors), 1)
+        err = cb.cancel_errors[0]
+        self.assertIsInstance(err.order_id, int)
+        self.assertEqual(str(err.order_id), "xt1082186097")
+
     def test_cancel_error_local_exception_carries_order_id(self):
         cb = _RecordingCallback()
         client = _CancelFakeClient(cancel_exc=RuntimeError("boom"))
         trader = self._trader(cb, client)
         trader.cancel_order_stock_async("acct", "sys-9")
+        trader.wait_async_orders(timeout=5.0)
         self.assertEqual(len(cb.cancel_errors), 1)
-        self.assertEqual(cb.cancel_errors[0].order_id, "sys-9")
+        self.assertEqual(str(cb.cancel_errors[0].order_id), "sys-9")
 
     def test_cancel_response_success_carries_cancel_result_and_error_msg(self):
         cb = _RecordingCallback()
         client = _CancelFakeClient(cancel_result={"success": True})
         trader = self._trader(cb, client)
         trader.cancel_order_stock_async("acct", "sys-9")
+        trader.wait_async_orders(timeout=5.0)
         self.assertEqual(len(cb.cancel_responses), 1)
         resp = cb.cancel_responses[0]
         self.assertEqual(resp.cancel_result, 0)
         self.assertEqual(resp.error_msg, "")
-        self.assertEqual(resp.order_id, "sys-9")
+        self.assertEqual(str(resp.order_id), "sys-9")
 
     def test_cancel_response_failure_carries_cancel_result_and_error_msg(self):
         cb = _RecordingCallback()
         client = _CancelFakeClient(cancel_result={"success": False})
         trader = self._trader(cb, client)
         trader.cancel_order_stock_async("acct", "sys-9")
+        trader.wait_async_orders(timeout=5.0)
         self.assertEqual(len(cb.cancel_responses), 1)
         resp = cb.cancel_responses[0]
         self.assertNotEqual(resp.cancel_result, 0)
@@ -337,13 +393,18 @@ class QueryPathSerializationContractTest(unittest.TestCase):
             strategy_name="strat-a",
             remark="rmk-9",
             order_time=1755655200,
+            traded_price=10.05,
+            price_type=11,
         )
         item = to_jsonable(snapshot)
         order = self._trader()._order_from_dict("acct", item)
-        self.assertEqual(order.order_id, "sys-9")
+        self.assertEqual(str(order.order_id), "sys-9")
+        self.assertIsInstance(order.order_id, int)      # issue #113
         self.assertEqual(order.order_time, 1755655200)
+        self.assertEqual(order.traded_price, 10.05)
         self.assertEqual(order.strategy_name, "strat-a")
         self.assertEqual(order.order_remark, "rmk-9")
+        self.assertEqual(order.price_type, 11)
 
 
     def test_query_trade_snapshot_with_official_fields_reaches_client(self):

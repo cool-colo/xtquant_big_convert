@@ -8,6 +8,7 @@ DryRunOrderGateway orders only. It does not submit real QMT orders.
 from bigqmt_signal_trader_strategy import (  # noqa: E402
     adjust,
     configure,
+    credit_account_callback,
     deal_callback,
     handlebar,
     init,

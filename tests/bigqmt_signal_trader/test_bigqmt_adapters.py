@@ -135,9 +135,10 @@ class BigQmtAdaptersTest(unittest.TestCase):
 
         ticks = provider.get_ticks(["rb2708.SF", "a2609.DF"])
 
-        # QMT is still asked in upper case...
-        self.assertEqual(context.tick_codes, [["RB2708.SF", "A2609.DF"]])
-        # ...but the caller gets its own spelling back.
+        # QMT is asked in the caller's own spelling now. Upper-casing here was
+        # what kept the #95 fix from reaching get_full_tick: "rb2610.SF" arrived
+        # as "RB2610.SF", which QMT does not recognise.
+        self.assertEqual(context.tick_codes, [["rb2708.SF", "a2609.DF"]])
         self.assertEqual(sorted(ticks), ["a2609.DF", "rb2708.SF"])
 
     def test_get_ticks_still_completes_the_suffix(self):
@@ -157,6 +158,159 @@ class BigQmtAdaptersTest(unittest.TestCase):
         ticks = BigQmtMarketDataProvider(ExtraContext()).get_ticks(["rb2708.SF"])
 
         self.assertEqual(sorted(ticks), ["SURPRISE.SF", "rb2708.SF"])
+
+    def test_get_ticks_maps_back_whichever_case_qmt_answers_in(self):
+        """We send the caller's spelling now, but whether QMT echoes that or
+        canonicalises could not be observed here -- this terminal has no futures
+        data. The mapping must hold either way, or #58 comes back."""
+        class Echoes:
+            def get_full_tick(self, codes):
+                return dict((c, {"lastPrice": 1.0}) for c in codes)
+
+        class Canonicalises:
+            def get_full_tick(self, codes):
+                return dict((c.upper(), {"lastPrice": 1.0}) for c in codes)
+
+        for context in (Echoes(), Canonicalises()):
+            ticks = BigQmtMarketDataProvider(context).get_ticks(
+                ["rb2708.SF", "a2609.DF"])
+            self.assertEqual(sorted(ticks), ["a2609.DF", "rb2708.SF"],
+                             context.__class__.__name__)
+
+    def test_get_ticks_recovers_missing_option_from_latest_tick_row(self):
+        """Full Big-QMT may omit .SHO from get_full_tick while tick history is live."""
+        class OptionContext:
+            def __init__(self):
+                self.full_tick_calls = []
+                self.market_calls = []
+
+            def get_full_tick(self, codes):
+                self.full_tick_calls.append(list(codes))
+                return {"510050.SH": {"lastPrice": 3.05}}
+
+            def get_market_data_ex_ori(self, fields=None, stock_code=None,
+                                       period="1d", start_time="", end_time="",
+                                       count=-1, dividend_type="none"):
+                self.market_calls.append({
+                    "fields": fields, "stock_code": stock_code,
+                    "period": period, "count": count,
+                    "dividend_type": dividend_type,
+                })
+                return {
+                    "10010974.SHO": {
+                        "time": [1, 2],
+                        "lastPrice": [0.0458, 0.0459],
+                        "bidPrice": [[0.0457], [0.0458]],
+                    },
+                    "90009999.SZO": {
+                        "time": [2],
+                        "lastPrice": [0.1234],
+                        "askPrice": [[0.1235]],
+                    },
+                }
+
+        context = OptionContext()
+        ticks = BigQmtMarketDataProvider(context).get_ticks([
+            "510050.SH", "10010974.SHO", "90009999.SZO",
+        ])
+
+        self.assertEqual(ticks["510050.SH"]["lastPrice"], 3.05)
+        self.assertEqual(ticks["10010974.SHO"]["lastPrice"], 0.0459)
+        self.assertEqual(ticks["10010974.SHO"]["bidPrice"], [0.0458])
+        self.assertEqual(ticks["90009999.SZO"]["lastPrice"], 0.1234)
+        self.assertEqual(context.full_tick_calls, [[
+            "510050.SH", "10010974.SHO", "90009999.SZO",
+        ]])
+        self.assertEqual(context.market_calls, [{
+            "fields": [],
+            "stock_code": ["10010974.SHO", "90009999.SZO"],
+            "period": "tick",
+            "count": 1,
+            "dividend_type": "none",
+        }])
+
+    def test_get_ticks_does_not_fallback_for_missing_non_option(self):
+        class EmptyContext:
+            def get_full_tick(self, codes):
+                return {}
+
+            def get_market_data_ex(self, *args, **kwargs):
+                raise AssertionError("non-option code must not use tick-history fallback")
+
+        self.assertEqual(
+            BigQmtMarketDataProvider(EmptyContext()).get_ticks(["510050.SH"]),
+            {},
+        )
+
+    def test_get_ticks_keeps_native_results_when_option_fallback_fails(self):
+        class FailingContext:
+            def get_full_tick(self, codes):
+                return {"510050.SH": {"lastPrice": 3.05}}
+
+            def get_market_data_ex(self, *args, **kwargs):
+                raise RuntimeError("unsupported on old QMT")
+
+        ticks = BigQmtMarketDataProvider(FailingContext()).get_ticks([
+            "510050.SH", "10010974.SHO",
+        ])
+
+        self.assertEqual(ticks, {"510050.SH": {"lastPrice": 3.05}})
+
+    def test_futures_exchange_tokens_reach_qmt_instead_of_raising(self):
+        """A futures exchange token used to die in normalize_stock_code with
+        "invalid stock code: IF", so a whole-exchange futures snapshot was
+        impossible. It goes through now; whether QMT has the data is its own
+        answer to give (this terminal returns empty for all six)."""
+        class FakeCtx:
+            def __init__(self):
+                self.asked = []
+
+            def get_full_tick(self, codes):
+                self.asked.append(list(codes))
+                return {}
+
+        for token in ("IF", "SF", "DF", "ZF", "INE", "GF"):
+            context = FakeCtx()
+            BigQmtMarketDataProvider(context).get_ticks([token])
+            self.assertEqual(context.asked, [[token]], token)
+
+    def test_option_exchange_tokens_reach_qmt_instead_of_raising(self):
+        """SHO/SZO are native QMT market tokens, not instrument codes.
+
+        The adapter must pass them through so the running terminal can answer
+        whether its build supports whole-option-market snapshots.
+        """
+        class FakeCtx:
+            def __init__(self):
+                self.asked = []
+
+            def get_full_tick(self, codes):
+                self.asked.append(list(codes))
+                return {}
+
+        for token in ("SHO", "SZO"):
+            context = FakeCtx()
+            BigQmtMarketDataProvider(context).get_ticks([token])
+            self.assertEqual(context.asked, [[token]], token)
+
+    def test_a_futures_token_is_never_narrowed_to_stocks(self):
+        """A futures exchange lists only futures -- the token already says what
+        it holds, so there is nothing to narrow and no A-share sector to use."""
+        class FakeCtx:
+            def __init__(self):
+                self.asked = []
+
+            def get_full_tick(self, codes):
+                self.asked.append(list(codes))
+                return {}
+
+        context = FakeCtx()
+        provider = BigQmtMarketDataProvider(context)
+        provider.get_stock_list_in_sector = lambda name: ["600000.SH"]
+
+        provider.get_ticks(["SF"], types=["stock"])
+
+        self.assertEqual(context.asked, [["SF"]])
 
     def test_market_provider_passes_market_codes_to_full_tick(self):
         context = FakeContext()
@@ -271,6 +425,9 @@ class BigQmtAdaptersTest(unittest.TestCase):
                     m_nVolumeTotalOriginal=1000,
                     m_nVolumeTraded=200,
                     m_nOrderStatus=50,
+                    m_dLimitPrice=10.12,
+                    m_nOrderPriceType=44,
+                    m_dTradedPrice=10.05,
                 )
             ]
 
@@ -290,6 +447,19 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(orders[0].stock_code, "000001.SZ")
         self.assertEqual(orders[0].action, "SELL")
         self.assertEqual(orders[0].traded_volume, 200)
+        self.assertEqual(orders[0].price, 10.12)
+        self.assertEqual(orders[0].price_type, 44)
+        self.assertEqual(orders[0].traded_price, 10.05)
+
+    def test_query_orders_optional_price_fields_keep_old_qmt_compatible(self):
+        """旧 QMT 不返回可选价格字段时保持 None。"""
+        def fake_query(*_args):
+            return [Obj(m_strOrderSysID="legacy-1", m_strRemark="legacy", m_strInstrumentID="000001", m_strExchangeID="SZ", m_nOffsetFlag=49, m_nVolumeTotalOriginal=200, m_nVolumeTraded=0, m_nOrderStatus=50)]
+
+        order = BigQmtOrderGateway(context_info=object(), get_trade_detail_data_func=fake_query).query_orders_strict("acct", "")[0]
+
+        self.assertIsNone(order.price_type)
+        self.assertEqual(order.traded_price, 0.0)
 
     def test_query_trades_without_strategy_omits_strategy_filter(self):
         calls = []
@@ -443,16 +613,16 @@ class UnparsableRowIsolationTest(unittest.TestCase):
     def _rows(self):
         return [
             self._Row(m_strInstrumentID="600000", m_strExchangeID="SH",
-                      m_nVolume=100, m_nCanUseVolume=100,
+                      m_nVolume=100, m_nCanUseVolume=100, m_nYesterdayVolume=100,
                       m_nVolumeTotalOriginal=100, m_nVolumeTraded=0,
                       m_strTradeID="t1", m_nVolume_deal=1),
             # Counter-style display ID -- _full_code raises on this one.
             self._Row(m_strInstrumentID="rb2401", m_strExchangeID="SHFE",
-                      m_nVolume=1, m_nCanUseVolume=1,
+                      m_nVolume=1, m_nCanUseVolume=1, m_nYesterdayVolume=1,
                       m_nVolumeTotalOriginal=1, m_nVolumeTraded=0,
                       m_strTradeID="t2"),
             self._Row(m_strInstrumentID="000001", m_strExchangeID="SZ",
-                      m_nVolume=200, m_nCanUseVolume=200,
+                      m_nVolume=200, m_nCanUseVolume=200, m_nYesterdayVolume=200,
                       m_nVolumeTotalOriginal=200, m_nVolumeTraded=0,
                       m_strTradeID="t3"),
         ]

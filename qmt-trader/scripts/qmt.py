@@ -52,8 +52,15 @@ def _ensure_src_on_path() -> None:
         candidate = ancestor / "src"
         if (candidate / "bigqmt_signal_trader" / "__init__.py").exists():
             src_str = str(candidate)
-            if src_str not in sys.path:
-                sys.path.insert(0, src_str)
+            # 不能只查 in sys.path：editable 安装会把 src 放在 site-packages
+            # 之后，site-packages 里的真 xtquant 就会遮蔽本仓库的 shim
+            # （实测：import xtquant 打印升级广告、污染 stdout 的 JSON 输出）。
+            # 必须确保 src 在最前——已存在就挪到最前。
+            if src_str in sys.path:
+                if sys.path.index(src_str) == 0:
+                    return
+                sys.path.remove(src_str)
+            sys.path.insert(0, src_str)
             return
     # 没找到仓库 src，假设用户已 pip install
     return
@@ -90,7 +97,12 @@ def _ensure_qmt_python_on_path() -> None:
         local_cfg = os.path.join(c, "bigqmt_signal_trader_local_config.py")
         if os.path.isfile(local_cfg):
             if c not in sys.path:
-                sys.path.insert(0, c)
+                # This path is needed to discover local_config.py, but must not
+                # shadow the checked-out/PyPI client package selected above.
+                # QMT commonly carries an older deployed package of the same
+                # name; putting it at sys.path[0] made new CLI commands execute
+                # against that stale copy.
+                sys.path.append(c)
             return
 
 
@@ -150,10 +162,36 @@ def _print_table(rows, headers=None):
             print(r)
 
 
-def _ok(data, table=False, headers=None):
+def _table_rows(data, table_key=None):
+    """The rows a --table render should show.
+
+    A command's payload is shaped for JSON, and that shape is usually a
+    wrapper: ``{"orders": [...], "count": 14}``. This used to hand the wrapper
+    itself to _print_table as a single row, so every header lookup missed and
+    the output was the header, the separator, and one line of spaces -- for
+    any amount of data. Five commands rendered that way (positions, orders,
+    trades, tick, kline).
+
+    ``table_key`` names the tabular list inside the wrapper. Without one:
+    a dict whose values are ALL dicts is keyed by something (tick is
+    ``{code: {...}}``) and its rows are the values; anything else is a single
+    flat record and stays one row -- account and instrument really are that,
+    and were correct before.
+    """
+    if table_key and isinstance(data, dict) and table_key in data:
+        data = data[table_key]
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and data and all(
+            isinstance(value, dict) for value in data.values()):
+        return list(data.values())
+    return [data]
+
+
+def _ok(data, table=False, headers=None, table_key=None):
     out = {"ok": True, "data": data, "ts": datetime.now().isoformat(timespec="seconds")}
     if table:
-        _print_table(data if isinstance(data, list) else [data], headers)
+        _print_table(_table_rows(data, table_key), headers)
     else:
         _print_json(out)
 
@@ -194,6 +232,10 @@ def _order_to_dict(o):
         "account_id", "stock_code", "order_type", "order_status",
         "order_volume", "traded_volume", "price", "order_sysid", "order_id",
         "strategy_name", "order_remark", "order_time",
+        # 柜台成交金额 (#173)。旧部署不发它, getattr 兜底成 None ——
+        # 这里给 None 而不是 0.0 是有意的: "服务端没告诉我" 和
+        # "成交金额确实是 0" 是两回事, 前者该看得出来。
+        "trade_amount",
     ]:
         d[attr] = getattr(o, attr, None)
     # 语义化
@@ -213,6 +255,14 @@ def _trade_to_dict(t):
     for attr in [
         "account_id", "stock_code", "order_type", "order_sysid", "order_id",
         "trade_id", "traded_volume", "traded_price", "traded_at", "order_remark",
+        # 成交行的策略名 (#174)。服务端一直在发它 —— 实盘只读核对过成交
+        # 应答带 strategy_name 这个键, 查询路径的 _attribute_to_strategies
+        # 还会把本桥下的单补回名字 —— 只有这里没列, 委托的 _order_to_dict
+        # 列了。#174 让人「回调拿不到就用查询兜一下」, 而照做的人用本 CLI
+        # 查成交, 看到的却是查询路径也没有策略名。
+        # 同 trade_amount: 取不到给 None 而不是 "", 「服务端没发」和
+        # 「这笔单没有策略名(手工单)」是两回事。
+        "strategy_name",
     ]:
         d[attr] = getattr(t, attr, None)
     d["order_type_name"] = {23: "BUY", 24: "SELL"}.get(d.get("order_type"), str(d.get("order_type", "")))
@@ -326,7 +376,7 @@ def cmd_positions(args):
         "total_market_value": round(sum(r.get("market_value") or 0 for r in rows), 2),
         "total_profit": round(sum(r.get("profit") or 0 for r in rows), 2),
     }
-    _ok({"positions": rows, "summary": summary}, table=args.table,
+    _ok({"positions": rows, "summary": summary}, table=args.table, table_key="positions",
         headers=["stock_code", "stock_name", "volume", "can_use_volume", "avg_price", "price", "market_value", "profit", "profit_pct"])
 
 
@@ -342,8 +392,8 @@ def cmd_orders(args):
     except Exception as e:
         _err("查询委托失败", detail=str(e), code="QUERY_FAIL")
     rows = [_order_to_dict(o) for o in (orders or [])]
-    _ok({"orders": rows, "count": len(rows)}, table=args.table,
-        headers=["stock_code", "order_type_name", "order_status_name", "order_volume", "traded_volume", "price", "order_sysid", "cancelable"])
+    _ok({"orders": rows, "count": len(rows)}, table=args.table, table_key="orders",
+        headers=["stock_code", "order_type_name", "order_status_name", "order_volume", "traded_volume", "price", "trade_amount", "order_sysid", "cancelable"])
 
 
 def cmd_trades(args):
@@ -354,7 +404,7 @@ def cmd_trades(args):
     except Exception as e:
         _err("查询成交失败", detail=str(e), code="QUERY_FAIL")
     rows = [_trade_to_dict(t) for t in (trades or [])]
-    _ok({"trades": rows, "count": len(rows)}, table=args.table,
+    _ok({"trades": rows, "count": len(rows)}, table=args.table, table_key="trades",
         headers=["stock_code", "order_type_name", "traded_volume", "traded_price", "traded_at", "order_sysid"])
 
 
@@ -433,8 +483,11 @@ def cmd_kline(args):
         stats["count"] = len(closes)
         stats["first_close"] = closes[0]
         stats["last_close"] = closes[-1]
-        stats["high"] = max(closes)
-        stats["low"] = min(closes)
+        # high/low 要用 K 线的 high/low 字段，closes 的极值不是最高价/最低价
+        highs = [r.get("high") for r in records if r.get("high") is not None]
+        lows = [r.get("low") for r in records if r.get("low") is not None]
+        stats["high"] = max(highs) if highs else max(closes)
+        stats["low"] = min(lows) if lows else min(closes)
         stats["change_pct"] = round((closes[-1] - closes[0]) / closes[0] * 100, 2) if closes[0] else None
         # 简单均线
         if len(closes) >= 5:
@@ -444,7 +497,8 @@ def cmd_kline(args):
         if len(closes) >= 60:
             stats["ma60"] = round(sum(closes[-60:]) / 60, 3)
     _ok({"code": args.code, "period": args.period, "bars": records, "stats": stats},
-        table=args.table, headers=["time", "open", "high", "low", "close", "volume"])
+        table=args.table, table_key="bars",
+        headers=["time", "open", "high", "low", "close", "volume"])
 
 
 def cmd_instrument(args):
@@ -456,6 +510,38 @@ def cmd_instrument(args):
     if detail is None:
         _err("未找到合约: %s" % args.code)
     _ok(detail, table=args.table)
+
+
+def cmd_option_greeks(args):
+    """Calculate one contract or a whole expiry locally from QMT market data."""
+    _, xtdata, _ = _init()
+    try:
+        common = {
+            "as_of": args.as_of,
+            "risk_free_rate": args.risk_free,
+            "dividend_yield": args.dividend,
+            "price_period": args.period,
+        }
+        if args.expiry:
+            result = xtdata.get_option_chain_analytics(
+                args.code,
+                args.expiry,
+                opttype=args.option_type or "",
+                isavailavle=args.available,
+                underlying_price=args.underlying_price,
+                **common
+            )
+        else:
+            result = xtdata.get_option_analytics(
+                args.code,
+                option_price=args.option_price,
+                underlying_price=args.underlying_price,
+                include_native_iv=args.native_iv,
+                **common
+            )
+    except Exception as e:
+        _err("期权 IV/Greeks 计算失败", detail=str(e), code="QUERY_FAIL")
+    _ok(result, table=args.table)
 
 
 def cmd_sector(args):
@@ -583,7 +669,7 @@ def _place_order(args, action):
         price = args.price
     strategy = args.strategy or "llm_agent"
     remark = args.remark or "llm_%s_%d" % (action.lower(), int(time.time()))
-    # 干跑模式
+    # 干跑模式：_ok 只打印不退出，必须 return，否则会穿透到真实下单
     if args.dry_run:
         _ok({
             "dry_run": True,
@@ -595,6 +681,7 @@ def _place_order(args, action):
             "strategy_name": strategy,
             "order_remark": remark,
         })
+        return
     # 真实下单
     try:
         order_id = tr.order_stock(
@@ -649,11 +736,35 @@ def cmd_cancel(args):
     acc = _acc_or(args.account)
     if args.dry_run:
         _ok({"dry_run": True, "order_sysid": args.order_id, "market": args.market or ""})
+        return
     try:
-        success = tr.cancel_order_stock_sysid(acc, args.market or "", args.order_id)
+        rc = tr.cancel_order_stock_sysid(acc, args.market or "", args.order_id)
     except Exception as e:
         _err("撤单失败", detail=str(e), code="CANCEL_FAIL")
-    _ok({"order_sysid": args.order_id, "market": args.market or "", "success": bool(success)})
+    # MiniQMT 契约：0=成功，-1=失败（issue #113）。bool(rc) 会把含义颠倒过来。
+    if rc != 0:
+        _err(
+            "撤单被拒绝（返回 %s）。委托可能已成/已撤/不存在——先用 orders 确认实际状态，"
+            "注意 issue #151：撤不存在的委托也可能返回成功" % rc,
+            code="CANCEL_REJECTED",
+        )
+    # 写完必须回读：撤单返回值只代表「请求发出去了」，不代表「撤成了」
+    time.sleep(0.5)
+    confirmed = None
+    try:
+        orders = tr.query_stock_orders(acc, strategy_name="")
+        for o in orders or []:
+            if str(getattr(o, "order_sysid", "")) == str(args.order_id):
+                confirmed = _order_to_dict(o)
+                break
+    except Exception:
+        pass
+    _ok({
+        "order_sysid": args.order_id,
+        "market": args.market or "",
+        "success": True,
+        "confirmed_order": confirmed,
+    })
 
 
 def cmd_snapshot(args):
@@ -729,6 +840,7 @@ def cmd_quote_subscribe(args):
     """订阅全推行情（打印前 N 条后退出）。"""
     _, xtdata, _ = _init()
     received = []
+    sub_id = None  # 首帧快照可能在 subscribe 返回前就推给回调，此时 sub_id 还没绑上
 
     def on_quote(data):
         for code, tick in (data or {}).items():
@@ -740,7 +852,7 @@ def cmd_quote_subscribe(args):
             }
             received.append(entry)
             print(json.dumps(entry, ensure_ascii=False))
-        if len(received) >= args.max:
+        if len(received) >= args.max and sub_id is not None:
             xtdata.unsubscribe_quote(sub_id)
             # 给一点时间让退订生效
             time.sleep(0.5)
@@ -824,6 +936,21 @@ def build_parser():
     sp = sub.add_parser("instrument", help="合约详情")
     sp.add_argument("code", help="股票代码")
     sp.set_defaults(func=cmd_instrument)
+
+    # option-greeks: one option code, or underlying + --expiry for a chain.
+    sp = sub.add_parser("option-greeks", help="本地计算期权 IV 和标准 Greeks")
+    sp.add_argument("code", help="期权代码；使用 --expiry 时传标的代码")
+    sp.add_argument("--expiry", default=None, help="到期月份/日期；提供后计算整条期权链")
+    sp.add_argument("--option-type", default="", help="期权链筛选 C/P")
+    sp.add_argument("--option-price", type=float, default=None, help="单合约期权价格（默认最新 close）")
+    sp.add_argument("--underlying-price", type=float, default=None, help="标的价格（默认最新 close）")
+    sp.add_argument("--risk-free", type=float, default=None, help="无风险利率小数（默认合约元数据）")
+    sp.add_argument("--dividend", type=float, default=0.0, help="连续分红率小数")
+    sp.add_argument("--as-of", default=None, help="估值时点 YYYY-MM-DD HH:MM:SS")
+    sp.add_argument("--period", default="1m", help="缺省价格所用 K 线周期")
+    sp.add_argument("--available", action="store_true", help="期权链只取可用合约")
+    sp.add_argument("--native-iv", action="store_true", help="单合约同时返回 QMT 原生 IV 作对照")
+    sp.set_defaults(func=cmd_option_greeks)
 
     # sector
     sp = sub.add_parser("sector", help="板块查询")
@@ -983,6 +1110,15 @@ def build_parser():
     sp.add_argument("--max", type=int, default=10, help="收到 N 条后退出")
     sp.add_argument("--timeout", type=int, default=30, help="超时秒数")
     sp.set_defaults(func=cmd_quote_subscribe)
+
+    # argparse 只认子命令之前的全局 flag，但 `qmt.py account --table` 才是
+    # 自然写法。给每个子命令也挂上这两个 flag：default=SUPPRESS 保证未提供时
+    # 不覆盖顶层解析到的值。
+    for subp in sub.choices.values():
+        subp.add_argument("--account", default=argparse.SUPPRESS,
+                          help="指定账号 ID（覆盖配置）")
+        subp.add_argument("--table", action="store_true", default=argparse.SUPPRESS,
+                          help="输出表格而非 JSON")
 
     return p
 

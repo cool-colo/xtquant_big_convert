@@ -44,6 +44,15 @@ class _FakeXtData:
         ))
         return True
 
+    def get_stock_type(self, stock_code, variety_list=None):
+        # 真实包装会抛 NotImplementedError；这里只验证 shim 转发到哪
+        self.calls.append(("get_stock_type", (stock_code,)))
+        return "ETF"
+
+    def call_method(self, method, **params):
+        self.calls.append(("call_method", (method, params)))
+        return "ETF"
+
 
 class XtdataShimSignatureTest(unittest.TestCase):
     def setUp(self):
@@ -86,6 +95,17 @@ class XtdataShimSignatureTest(unittest.TestCase):
         name, args = self.fake.calls[-1]
         self.assertEqual(name, "download_history_data2")
         self.assertEqual(args[-1], "front")
+
+    def test_get_stock_type_forwards_to_the_wrapper(self):
+        """顶层 shim 只转发，不复制证券分类逻辑。
+
+        以前走 call_method("get_stock_type")，绕开了包装。实盘验证后包装改成
+        拒绝（服务端 ContextInfo stub 对任何代码都返回 0），两条路径必须一致，
+        否则顶层 xtdata 还会把那个 0 递给调用方。详见
+        test_get_stock_type_unavailable.py。
+        """
+        self.assertEqual(shim.get_stock_type("510300.SH"), "ETF")
+        self.assertEqual(self.fake.calls, [("get_stock_type", ("510300.SH",))])
 
 
 if __name__ == "__main__":

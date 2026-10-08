@@ -1,19 +1,30 @@
 # coding: utf-8
 """Client-side private config example for MiniQMT-compatible replacement.
 
-Copy this file to:
-
-    src/bigqmt_signal_trader_client_config.py
+Copy this file to ``bigqmt_signal_trader_client_config.py`` in the directory
+of the script that runs the client. It is found by ``import``, so it has to
+be on ``sys.path``: next to the script is simplest; anywhere on PYTHONPATH
+works; ``BIGQMT_CLIENT_CONFIG_MODULE=<module>`` names one explicitly. When
+none is found the client falls back to ``bigqmt_signal_trader_local_config``
+(the QMT-side file), which is why running from the QMT python directory
+happens to work and running from anywhere else does not.
 
 Do not commit the real file. It may contain account ids and Redis credentials.
 """
 
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
-BIGQMT_RPC_TIMEOUT_SECONDS = 6.0
+BIGQMT_RPC_TIMEOUT_SECONDS = 30.0
 BIGQMT_DOWNLOAD_WAIT_SECONDS = 1800
 BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS = 0.5
 
 BIGQMT_REDIS_CONFIG = {
+    # 账户查询（持仓/资产）失败时，是否用 redis 里的上一份快照作答。
+    # 默认 False —— 查询失败就抛给调用方，和 zmq/pipe 一致。打开它等于接受
+    # 「拿旧持仓当当前持仓」，策略据此算仓位是会出事的（#243）。
+    # 打开后仍要求快照带 updated_at 且在时限内，否则照样抛。
+    # "account_cache_fallback": False,
+    # "account_cache_max_age_seconds": 30,
+
     "host": "YOUR_REDIS_HOST",
     "port": 6379,
     "db": 5,
@@ -49,12 +60,14 @@ BIGQMT_FULL_TICK_CACHE_CONFIG = {
 #   then reads them locally with NO RPC to Big QMT (for offline / repeated local
 #   analysis). download_history_data* submits a server-side Big QMT download job.
 #   - dir: cache folder (default ~/.bigqmt_cache), one pickle per (period, code).
-#   - fallback_rpc: if True, get_local_data auto-fetches+caches a cache miss;
-#     if False (default), a cache-missed code is simply omitted (download first).
+#   - fallback_rpc: if True (default), get_local_data auto-fetches+caches a
+#     cache miss.  This preserves MiniQMT's visible behaviour when a caller
+#     downloads raw data and then reads a different adjustment mode.
+#     Set False only when this client must be strictly offline/cache-only.
 BIGQMT_LOCAL_CACHE_CONFIG = {
     "enabled": True,
     "dir": None,            # None -> ~/.bigqmt_cache
-    "fallback_rpc": False,
+    "fallback_rpc": True,
     # Storage format: "auto" (parquet if pyarrow installed, else pickle),
     # "parquet" (columnar/compressed/cross-language — recommended), or "pkl".
     # One file per (period, dividend_type, code); switching format auto-migrates.

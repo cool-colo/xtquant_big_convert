@@ -25,6 +25,12 @@ from bigqmt_signal_trader.xtquant_compat import (
 from bigqmt_signal_trader.full_tick_cache import full_tick_demand_key, full_tick_request_id, write_full_tick_cache
 
 
+
+def _now_stamp():
+    import datetime as _d
+    return _d.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 class FakeRpcClient:
     def __init__(self):
         self.account_id = "acct"
@@ -321,8 +327,12 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(trades[0].order_type, STOCK_BUY)
         self.assertEqual(trades[0].traded_price, 10.0)
         self.assertEqual(trades[0].order_remark, "remark-1")
-        self.assertEqual(order_id, "sys-2")
-        self.assertTrue(cancelled)
+        # MiniQMT hands back an int 委托编号; Big QMT only has the broker's
+        # string 合同编号, so the id is both (issue #113).
+        self.assertEqual(str(order_id), "sys-2")
+        self.assertIsInstance(order_id, int)
+        self.assertGreater(order_id, 0)
+        self.assertEqual(cancelled, 0)      # 0 == success, not True
         self.assertEqual(trader.client.calls[-2][1]["price_type"], MARKET_PEER_PRICE_FIRST)
         # strategy_name 默认 ""（返回全部委托），与服务端一致（strategy_name 陷阱）。
         self.assertEqual(trader.client.calls[-4][1]["strategy_name"], "")
@@ -493,11 +503,39 @@ class XtquantCompatTest(unittest.TestCase):
     def test_quote_subscribe_and_unsubscribe_write_redis_events(self):
         xtdata = self._xtdata()
 
+        # Tick subscriptions ride the whole-quote push session now (#95), so
+        # stand one in; the bookkeeping this test covers is unchanged.
+        class _Session(object):
+            def __init__(self):
+                self.active = set()
+                self.subscribed = []
+
+            def start(self):
+                pass
+
+            def subscribe_whole_quote(self, code_list, callback=None):
+                self.subscribed.append(list(code_list))
+                sub_id = 900 + len(self.subscribed)
+                self.active.add(sub_id)
+                return sub_id
+
+            def unsubscribe_quote(self, sub_id):
+                self.active.discard(sub_id)
+                return 0
+
+            def has_subscription(self, sub_id):
+                return sub_id in self.active
+
+        session = _Session()
+        xtdata._quote_session_factory = lambda: session
+
         seq = xtdata.subscribe_quote("600000.SH", period="tick")
         result = xtdata.unsubscribe_quote(seq)
 
         key = "bigqmt:quote_subscriptions:acct"
         self.assertEqual(result, 0)
+        self.assertEqual(session.subscribed, [["600000.SH"]])
+        self.assertNotIn(seq, session.active)
         self.assertNotIn(str(seq), xtdata.client.redis.hashes.get(key, {}))
         self.assertIn((key, str(seq)), xtdata.client.redis.deleted)
         self.assertEqual(xtdata.client.redis.events[0][0], "subscribe_quote")
@@ -537,6 +575,7 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(client.redis_config["username"], "cfg-user")
         self.assertEqual(client.redis_config["password"], "cfg-pass")
         self.assertEqual(client.timeout_seconds, 9)
+        self.assertIs(client.local_cache_config["fallback_rpc"], True)
 
     def test_explicit_client_params_override_private_config(self):
         module_name, old_env = self._with_fake_config()
@@ -555,7 +594,7 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(client.redis_config["password"], "")
         self.assertEqual(client.timeout_seconds, 3)
 
-    def test_trader_falls_back_to_cached_positions_when_rpc_fails(self):
+    def _failing_client_with_cache(self, updated_at):
         class FailingRpcClient(FakeRpcClient):
             def call(self, method, params=None, account_id=None, timeout_seconds=None):
                 if method in ("query_stock_asset", "query_stock_positions", "query_stock_position"):
@@ -563,7 +602,7 @@ class XtquantCompatTest(unittest.TestCase):
                 return super().call(method, params, account_id, timeout_seconds)
 
         client = FailingRpcClient()
-        client.redis.hashes["bigqmt:positions:acct"] = {
+        snapshot = {
             "account_id": "acct",
             "asset": {"cash": 123.0, "total_asset": 456.0},
             "positions": {
@@ -576,8 +615,33 @@ class XtquantCompatTest(unittest.TestCase):
                 }
             },
         }
+        if updated_at is not None:
+            snapshot["updated_at"] = updated_at
+        client.redis.hashes["bigqmt:positions:acct"] = snapshot
+        return client
+
+    def test_a_failed_account_query_is_not_answered_from_cache_by_default(self):
+        """#243：以前只要缓存非空就当查询成功，把原生异常吞掉了。
+
+        对交易系统来说这是最坏的一种错——策略拿旧持仓去算仓位，而调用看起来
+        完全正常。默认改为传播，要回退得显式打开 account_cache_fallback。
+        """
         trader = BigQmtXtTrader(account_id="acct")
-        trader.client = client
+        trader.client = self._failing_client_with_cache(_now_stamp())
+        acc = StockAccount("acct")
+
+        for call in (lambda: trader.query_stock_asset(acc),
+                     lambda: trader.query_stock_positions(acc),
+                     lambda: trader.query_stock_position(acc, "600000")):
+            with self.assertRaises(RuntimeError):
+                call()
+
+    def test_opting_in_serves_a_fresh_snapshot(self):
+        trader = BigQmtXtTrader(
+            account_id="acct",
+            redis_config={"transport": "redis", "account_cache_fallback": True},
+        )
+        trader.client = self._failing_client_with_cache(_now_stamp())
         acc = StockAccount("acct")
 
         asset = trader.query_stock_asset(acc)
@@ -589,6 +653,15 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(positions[0].stock_code, "600000.SH")
         self.assertEqual(positions[0].can_use_volume, 80)
         self.assertEqual(single.stock_name, "cached")
+
+    def test_opting_in_still_refuses_a_stale_snapshot(self):
+        trader = BigQmtXtTrader(
+            account_id="acct",
+            redis_config={"transport": "redis", "account_cache_fallback": True},
+        )
+        trader.client = self._failing_client_with_cache("2000-01-01 00:00:00")
+        with self.assertRaises(RuntimeError):
+            trader.query_stock_positions(StockAccount("acct"))
 
     def test_zmq_query_failure_never_falls_back_to_redis_cache(self):
         class FailingZmqClient(FakeRpcClient):
@@ -736,6 +809,386 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(transport.name, "zmq")
         self.assertEqual(transport.connect_address, "tcp://127.0.0.1:20146")
         self.assertIsNone(transport.discovery_redis_client)
+
+    def test_pure_zmq_quote_metadata_does_not_build_redis_client(self):
+        """纯 ZMQ 的兼容订阅元数据不能隐式连接 Redis。"""
+        client = BigQmtRpcClient(account_id="acct", redis_config={"transport": "zmq"})
+        client._redis = lambda: (_ for _ in ()).throw(AssertionError("Redis must not be used"))
+
+        event = client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        self.assertEqual(event["event_type"], "subscribe_quote")
+
+    def test_mysql_quote_metadata_keeps_existing_redis_path(self):
+        """非 ZMQ transport 继续使用既有 Redis 订阅元数据。"""
+        class RedisRecorder:
+            def __init__(self):
+                self.calls = []
+
+            def xadd(self, *args, **kwargs):
+                self.calls.append("xadd")
+
+            def publish(self, *args, **kwargs):
+                self.calls.append("publish")
+
+            def hset(self, *args, **kwargs):
+                self.calls.append("hset")
+
+        redis = RedisRecorder()
+        client = BigQmtRpcClient(account_id="acct", redis_client=redis, redis_config={"transport": "mysql"})
+
+        client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        self.assertEqual(redis.calls, ["xadd", "publish", "hset"])
+
+
+class UseFormulaBypassTest(unittest.TestCase):
+    """use_formula=False：必须最新数据的调用（subscribe_quote 盘中轮询）
+    不走 FormulaServer 快照直连。"""
+
+    def test_call_with_use_formula_false_skips_router(self):
+        calls = []
+
+        class _FakeRouter:
+            def supports(self, method):
+                return True
+
+            def call(self, method, params):
+                raise AssertionError("router must not be called when use_formula=False")
+
+        class _FakeTransport:
+            def send_request(self, request, timeout_seconds):
+                calls.append(request["method"])
+                return {"ok": True, "data": {"pong": True}}
+
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = _FakeTransport()
+        client._formula_router_instance = _FakeRouter()
+
+        result = client.call("get_market_data_ex", {"x": 1}, use_formula=False)
+        self.assertEqual(result, {"pong": True})
+        self.assertEqual(calls, ["get_market_data_ex"])
+
+    def test_subscribe_quote_fetch_uses_rpc_not_formula(self):
+        xt = BigQmtXtData(FakeRpcClient())
+        recorded = {}
+
+        def spy(**kwargs):
+            recorded.update(kwargs)
+            return {"acct": None}
+
+        fetch_holder = {}
+
+        from bigqmt_signal_trader.xtquant_compat import _BarPoller
+
+        class _P(_BarPoller):
+            def __init__(self, f, callback, interval, **kwargs):
+                fetch_holder["fetch"] = f
+                super().__init__(f, callback, interval, **kwargs)
+
+        import bigqmt_signal_trader.xtquant_compat as compat_mod
+        compat_mod._BarPoller = _P
+        try:
+            xt.get_market_data_ex = spy
+            xt.subscribe_quote("600000.SH", period="1m", count=1, callback=None)
+        finally:
+            compat_mod._BarPoller = _BarPoller
+
+        fetch = fetch_holder.get("fetch")
+        self.assertIsNotNone(fetch)
+        fetch()
+        self.assertFalse(recorded.get("use_formula", True),
+                         "subscribe_quote 盘中轮询必须 use_formula=False（读实时数据）")
+
+
+class FormulaStaleFailoverTest(unittest.TestCase):
+    """公式滞后自动回落：本次调用回落 RPC 桥、冷却期跳过直连、到期自愈。"""
+
+    def _bar(self, ts):
+        import pandas as pd
+
+        return pd.DataFrame({"stime": [ts], "close": [1.0]})
+
+    def setUp(self):
+        import datetime as _dt
+        from bigqmt_signal_trader import xtquant_compat as xc
+
+        self.xc = xc
+        self.xc._formula_stale_until["ts"] = 0.0
+        self.old_bar = (_dt.datetime.now() - _dt.timedelta(hours=3)).strftime("%Y%m%d%H%M%S")
+        self.fresh_bar = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def _client(self, stale):
+        xc = self.xc
+
+        class _Router:
+            def __init__(self):
+                self.calls = 0
+
+            def supports(self, method):
+                return True
+
+            def call(self, method, params):
+                self.calls += 1
+                bar = self.old_bar if stale else self.fresh_bar
+                return {"600000.SH": self._bar(bar)}
+
+        class _Transport:
+            def __init__(self):
+                self.calls = 0
+
+            def send_request(self, request, timeout_seconds):
+                self.calls += 1
+                return {"ok": True, "data": {"fresh": True}}
+
+        router = _Router()
+        router.old_bar = self.old_bar
+        router.fresh_bar = self.fresh_bar
+        router._bar = self._bar
+        transport = _Transport()
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = transport
+        client._formula_router_instance = router
+        return client, router, transport
+
+    def test_stale_answer_fails_over_to_transport(self):
+        client, router, transport = self._client(stale=True)
+        result = client.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(result, {"fresh": True})
+        self.assertEqual(transport.calls, 1)
+
+    def test_cooldown_skips_router(self):
+        client, router, transport = self._client(stale=True)
+        client.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(router.calls, 1)
+        client.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(router.calls, 1)  # 冷却期内不再付公式成本
+        self.assertEqual(transport.calls, 2)
+
+    def test_cooldown_expiry_restores_formula(self):
+        client, router, transport = self._client(stale=True)
+        client.call("get_market_data_ex", {"period": "1m"})
+        self.xc._formula_stale_until["ts"] = 0.0
+        client2, router2, _ = self._client(stale=False)
+        result = client2.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(router2.calls, 1)
+        self.assertNotEqual(result, {"fresh": True})
+
+
+class FormulaStaleWarnTest(unittest.TestCase):
+    """FormulaServer 快照滞后检测：intraday 滞后即告警、同日不重复、日线不报。"""
+
+    def _df(self, bar):
+        import pandas as pd
+
+        return pd.DataFrame({"close": [1.0]}, index=[bar])
+
+    def setUp(self):
+        import datetime as _dt
+        from bigqmt_signal_trader import xtquant_compat as xc
+
+        self.xc = xc
+        self.warns = []
+        self._orig_log = xc.log
+
+        class _L:
+            def warning(_, msg, *a):
+                self.warns.append(msg % a if a else msg)
+
+        xc.log = _L()
+        xc._formula_stale_warned.clear()
+        self.old_bar = (_dt.datetime.now() - _dt.timedelta(hours=3)).strftime("%Y%m%d%H%M%S")
+        self.fresh_bar = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def tearDown(self):
+        self.xc.log = self._orig_log
+
+    def test_intraday_stale_bar_warns_once_per_day(self):
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.old_bar)}, {"period": "1m"})
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.old_bar)}, {"period": "1m"})
+        self.assertEqual(len(self.warns), 1)
+        self.assertIn("stale", self.warns[0])
+
+    def test_fresh_bar_does_not_warn(self):
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.fresh_bar)}, {"period": "1m"})
+        self.assertEqual(self.warns, [])
+
+    def test_daily_period_is_not_time_checked(self):
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.old_bar)}, {"period": "1d"})
+        self.assertEqual(self.warns, [])
+
+    def test_bad_input_never_raises(self):
+        self.xc._warn_stale_formula_bars(None, {})
+        self.xc._warn_stale_formula_bars({"X": self._df("not-a-date")}, {"period": "1m"})
+
+
+class PartialAnswerMarkerTest(unittest.TestCase):
+    """#237: the server marks an answer that is not the one that was asked for
+    (fewer columns, a dropped argument, a different servant). The client has to
+    carry that onto the frame and say so out loud -- the whole failure mode is
+    an answer that looks complete and is not, and the server's log is on the
+    trading machine where the caller is not looking."""
+
+    MARKER = {
+        "reason": "synth_period_primary_empty",
+        "period": "1mon",
+        "source": "ContextInfo.get_market_data",
+        "requested": ["close", "preClose"],
+        "served": ["close"],
+        "missing": ["preClose"],
+        "fill_data_dropped": True,
+        "padding_rows_dropped": 7,
+    }
+
+    def setUp(self):
+        try:
+            import pandas  # noqa: F401
+        except ImportError:
+            self.skipTest("pandas is not installed")
+        import bigqmt_signal_trader.xtquant_compat as compat
+        compat._partial_warned.clear()
+
+    def _envelope(self, marker=True):
+        frame = {
+            "__bigqmt_type__": "DataFrame",
+            "columns": ["stime", "close"],
+            "records": [["20260831", 1299.52], ["20260930", 1290.88]],
+        }
+        if marker:
+            frame["__bigqmt_partial__"] = dict(self.MARKER)
+        return {"600519.SH": frame}
+
+    def test_restore_puts_the_marker_on_the_frame(self):
+        from bigqmt_signal_trader.xtquant_compat import (
+            PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        data = _restore_jsonable(self._envelope())
+
+        frame = data["600519.SH"]
+        self.assertEqual(2, len(frame))
+        self.assertEqual(self.MARKER, frame.attrs[PARTIAL_MARKER_ATTR])
+        self.assertNotIn("__bigqmt_partial__", list(frame.columns))
+
+    def test_an_unmarked_answer_rebuilds_exactly_as_before(self):
+        """Skew both ways: an old server sends no marker, and a new client
+        must not invent one."""
+        from bigqmt_signal_trader.xtquant_compat import (
+            PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        frame = _restore_jsonable(self._envelope(marker=False))["600519.SH"]
+
+        self.assertEqual(["stime", "close"], list(frame.columns))
+        self.assertNotIn(PARTIAL_MARKER_ATTR, dict(frame.attrs))
+
+    def test_the_marker_survives_normalisation_and_warns(self):
+        import warnings as _warnings
+
+        from bigqmt_signal_trader.xtquant_compat import (
+            BigQmtXtData, PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        envelope = self._envelope()
+
+        class _Client:
+            account_id = "acct"
+            local_cache_config = {}
+            full_tick_cache_config = {}
+
+            def call(self, method, params=None, timeout_seconds=None, **kwargs):
+                return _restore_jsonable(envelope)
+
+        xt = BigQmtXtData(_Client())
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            data = xt._get_market_data_ex_batch(
+                {"field_list": ["close"], "stock_list": ["600519.SH"],
+                 "period": "1mon", "count": 2})
+
+        frame = data["600519.SH"]
+        # Normalisation copies, slices and drops columns; pandas only
+        # propagates attrs on a best-effort basis, so the marker is carried
+        # across explicitly rather than hoped for.
+        self.assertEqual(self.MARKER, frame.attrs[PARTIAL_MARKER_ATTR])
+        messages = [str(item.message) for item in caught]
+        self.assertTrue(any("MISSING preClose" in text for text in messages),
+                        messages)
+        self.assertTrue(any("ContextInfo.get_market_data" in text
+                            for text in messages), messages)
+        self.assertTrue(any("fill_data did not reach the terminal" in text
+                            for text in messages), messages)
+
+    def test_the_same_degradation_warns_once(self):
+        """A bar poll runs this per second; #139 is what one unthrottled line
+        per call costs."""
+        import warnings as _warnings
+
+        from bigqmt_signal_trader.xtquant_compat import _warn_partial_market_data
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            for _ in range(5):
+                _warn_partial_market_data([dict(self.MARKER)])
+
+        self.assertEqual(1, len(caught))
+
+    def test_an_unmarked_answer_never_warns(self):
+        import warnings as _warnings
+
+        from bigqmt_signal_trader.xtquant_compat import (
+            BigQmtXtData, PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        envelope = self._envelope(marker=False)
+
+        class _Client:
+            account_id = "acct"
+            local_cache_config = {}
+            full_tick_cache_config = {}
+
+            def call(self, method, params=None, timeout_seconds=None, **kwargs):
+                return _restore_jsonable(envelope)
+
+        xt = BigQmtXtData(_Client())
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            data = xt._get_market_data_ex_batch(
+                {"field_list": ["close"], "stock_list": ["600519.SH"],
+                 "period": "1mon", "count": 2})
+
+        self.assertEqual([], [str(item.message) for item in caught])
+        self.assertNotIn(PARTIAL_MARKER_ATTR,
+                         dict(data["600519.SH"].attrs))
+
+
+class SynthRescueOnlyIsNotRoutedToFormulaTest(unittest.TestCase):
+    """#237's diagnostic asks the bridge to skip the primary. FormulaServer has
+    no such concept and would answer normally, so a dead rescue would read as
+    alive. It must go to the RPC bridge."""
+
+    def test_the_flag_makes_the_params_untranslatable(self):
+        from bigqmt_signal_trader.formula_server import _market_data_params
+
+        base = {"field_list": ["close"], "stock_list": ["600519.SH"],
+                "period": "1mon", "count": 10}
+        # Without the flag it routes fine.
+        self.assertEqual(["600519.SH"],
+                         _market_data_params(dict(base))["stockCodes"])
+        with self.assertRaises(ValueError):
+            _market_data_params(dict(base, synth_fallback_only=True))
+
+    def test_a_false_flag_still_routes(self):
+        from bigqmt_signal_trader.formula_server import _market_data_params
+
+        base = {"field_list": ["close"], "stock_list": ["600519.SH"],
+                "period": "1mon", "count": 10}
+        for value in (False, "false", "0", "", None):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    ["600519.SH"],
+                    _market_data_params(
+                        dict(base, synth_fallback_only=value))["stockCodes"])
 
 
 if __name__ == "__main__":

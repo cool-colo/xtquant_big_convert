@@ -5,6 +5,11 @@ description: "通过统一 CLI 脚本驱动大 QMT 迅投量化交易端的全�
 
 # QMT Trader — 大模型驱动的 QMT 交易/行情工具
 
+## 来源
+
+- 仓库：https://github.com/litaolemo/xtquant_big_convert
+- 技能目录：https://github.com/litaolemo/xtquant_big_convert/tree/main/qmt-trader
+
 ## 概述
 
 本 skill 提供一个确定性 CLI 脚本 `scripts/qmt.py`，让大模型通过命令行调用大 QMT 的全部
@@ -29,7 +34,7 @@ pip install "xtquant-big-convert[redis]"   # redis 传输（默认，推荐）
 
 ### 第 2 步：把服务端文件同步到 QMT 的 python 目录
 
-需要拷 4 项到大 QMT 的 `python` 目录（如 `D:\国金证券QMT交易端\python\`）：
+需要拷 4 项到大 QMT 的 `python` 目录（如 `D:\QMT交易端\python\`）：
 
 ```
 bigqmt_signal_trader/                  （整个包，pip 装的在 site-packages 里）
@@ -58,18 +63,26 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": False,     # 下单开关，默认关闭；确认风控后改 True
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": False,      # 若切 zmq/mysql 传输必须改 True
+    "rpc_background_threads": True,       # redis 用后台收包线程最快；zmq/pipe 要改 False
     "schedule_adjust": True,
-    "schedule_adjust_interval": "500nMilliSecond",
+    "schedule_adjust_interval": "100nMilliSecond",
 }
 ```
 
-> 切 zmq：配置里加 `"transport": "zmq"` 并把 `rpc_background_threads` 改 `True`（QMT 端需装 pyzmq 19.0.2，Python 3.6 最后支持的版本）。
+> **这个开关按传输选，选反了差几十倍**（实测见 docs/USER_GUIDE.md 的传输对比表）：
+> redis 用 `True`（3.4ms），zmq 用 `False` 走 adjust drain（zmq 15.8ms）。
+> zmq 配 `True` 是 592.9ms —— 慢 37 倍。原因是 zmq / pipe 的后台线程每次都要付
+> 跨线程 GIL 交接（约一个 adjust tick），redis 的 `brpop` 唤醒没有这一步。
+>
+> 切 zmq：配置里加 `"transport": "zmq"` 并把 `rpc_background_threads` 改 `False`
+> （QMT 端需装 pyzmq 19.0.2，Python 3.6 最后支持的版本）。
 
 ### 第 4 步：在 QMT 策略编辑器运行入口
 
 QMT 策略编辑器里**只加载运行 `BIGQMT_REDIS_DRYRUN.py` 一个文件**（它自动 import 其余模块）。
-若 QMT 装在非默认路径且用 exec 方式加载，需改文件里 `_known_qmt_python_dir()` 的 fallback 路径。
+装在非默认路径不用改任何代码：入口先用自己 `__file__` 所在目录，取不到才回落
+到扫 `sys.path`。（旧版文档教人改 `_known_qmt_python_dir()` 的写死路径，
+那会让你多背一个源码补丁，现在不需要了。）
 
 启动成功标志（QMT 输出面板）：
 
@@ -90,7 +103,7 @@ $env:BIGQMT_REDIS_HOST="Redis地址"; $env:BIGQMT_REDIS_PORT="6379"
 $env:BIGQMT_REDIS_DB="5"; $env:BIGQMT_REDIS_PASSWORD="Redis密码"
 ```
 
-然后验证（redis ~13ms / zmq ~0.7ms 为正常）：
+然后验证（redis ~3ms / zmq+drain ~16ms 为正常，实测口径见 docs/USER_GUIDE.md 传输对比表）：
 
 ```bash
 python scripts/qmt.py ping
@@ -114,7 +127,7 @@ python scripts/qmt.py ping
 python scripts/qmt.py ping
 ```
 
-返回 `ok: true` 且 `latency_ms` 合理（redis ~13ms / zmq ~0.7ms）即表示服务端就绪。
+返回 `ok: true` 且 `latency_ms` 合理（redis ~3ms / zmq+drain ~16ms）即表示服务端就绪。
 
 ### 第 1 步：一键快照（资产+持仓+委托+成交）
 
@@ -172,6 +185,8 @@ python scripts/qmt.py snapshot
 | `market-times [market]` | 日内交易时段 | `market-times SH` |
 | `trading-calendar [market]` | 交易日历(含时段) | `trading-calendar SH` |
 | `option-list <code>` | 期权列表 | `option-list 510050.SH` |
+| `option-greeks <code>` | 本地 IV + Delta/Gamma/Vega/Theta/Rho | `option-greeks 10010975.SHO` |
+| `option-greeks <underlying> --expiry <yyyymm>` | 整条到期月份 Greeks | `option-greeks 510050.SH --expiry 202609` |
 | `bsm-price ...` | BSM 期权定价 | `bsm-price C 3.0 2.8 0.03 0.3 30` |
 | `bsm-iv ...` | BSM 隐含波动率 | `bsm-iv C 3.0 2.8 0.25 0.03 30` |
 | `hkt-stats <code>` | 港股通统计 | `hkt-stats 600000.SH` |
@@ -316,6 +331,8 @@ python scripts/qmt.py north
 - `market-times [market]` — 日内交易时段
 - `trading-calendar [market]` — 交易日历（含时段）
 - `option-list <code>` — 期权列表
+- `option-greeks <option_code>` — 从合约元数据和最新 close 本地计算 IV、Delta/Gamma/Vega/Theta/Rho；可传 `--option-price` / `--underlying-price` 使用盘口中间价
+- `option-greeks <underlying> --expiry <yyyymm>` — 批量计算整条到期月份；坏价保留为逐合约 `analytics_error`
 - `bsm-price` / `bsm-iv` — BSM 期权定价/隐含波动率
 - `hkt-stats` / `hkt-details` / `hkt-rate` — 港股通统计/明细/汇率
 - `top10-holder <code>` / `holder-num <code>` — 十大股东/股东户数

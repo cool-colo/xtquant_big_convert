@@ -34,6 +34,23 @@ class FakeContextInfo:
         return 0
 
 
+class HybridFakeContextInfo(FakeContextInfo):
+    def __init__(self, fail_option_code=None):
+        super().__init__()
+        self.fail_option_code = fail_option_code
+        self.callbacks = {}
+
+    def subscribe_quote(self, stock_code, period, dividend_type, result_type, callback):
+        self.calls.append((
+            "subscribe_quote", stock_code, period, dividend_type, result_type,
+        ))
+        if stock_code == self.fail_option_code:
+            return -1
+        self._next += 1
+        self.callbacks[self._next] = callback
+        return self._next
+
+
 class ContextInfoQuoteSourceTest(unittest.TestCase):
     def test_subscribe_returns_handle_and_forwards_callback(self):
         context = FakeContextInfo()
@@ -55,6 +72,61 @@ class ContextInfoQuoteSourceTest(unittest.TestCase):
         handle = source.subscribe(["SH"], lambda d: None)
         source.unsubscribe(handle)
         self.assertEqual(context.calls[-1], ("unsubscribe", handle))
+
+    def test_option_uses_single_quote_list_and_normalizes_latest_tick(self):
+        context = HybridFakeContextInfo()
+        source = ContextInfoQuoteSource(context)
+        received = []
+
+        handle = source.subscribe(["10010974.SHO"], received.append)
+        context.callbacks[handle]({
+            "10010974.SHO": {
+                "time": [1, 2],
+                "lastPrice": [0.0458, 0.0459],
+                "bidPrice": [[0.0457, 0.0456], [0.0458, 0.0457]],
+                "askPrice": [[0.0459, 0.0460], [0.0460, 0.0461]],
+            }
+        })
+
+        self.assertEqual(context.calls, [(
+            "subscribe_quote", "10010974.SHO", "tick", "none", "list",
+        )])
+        self.assertEqual(received, [{
+            "10010974.SHO": {
+                "time": 2,
+                "lastPrice": 0.0459,
+                "bidPrice": [0.0458, 0.0457],
+                "askPrice": [0.0460, 0.0461],
+            }
+        }])
+
+    def test_mixed_codes_split_whole_quote_and_option_handles(self):
+        context = HybridFakeContextInfo()
+        source = ContextInfoQuoteSource(context)
+
+        handle = source.subscribe(
+            ["510050.SH", "10010974.SHO", "90009999.SZO"], lambda data: None
+        )
+
+        self.assertEqual(handle, (1, 2, 3))
+        self.assertEqual(context.calls, [
+            ("subscribe", ["510050.SH"]),
+            ("subscribe_quote", "10010974.SHO", "tick", "none", "list"),
+            ("subscribe_quote", "90009999.SZO", "tick", "none", "list"),
+        ])
+        source.unsubscribe(handle)
+        self.assertEqual(context.calls[-3:], [
+            ("unsubscribe", 1), ("unsubscribe", 2), ("unsubscribe", 3),
+        ])
+
+    def test_option_subscribe_failure_rolls_back_created_handles(self):
+        context = HybridFakeContextInfo(fail_option_code="10010974.SHO")
+        source = ContextInfoQuoteSource(context)
+
+        with self.assertRaises(RuntimeError):
+            source.subscribe(["510050.SH", "10010974.SHO"], lambda data: None)
+
+        self.assertEqual(context.calls[-1], ("unsubscribe", 1))
 
 
 

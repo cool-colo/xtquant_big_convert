@@ -24,9 +24,20 @@ Deliberately NOT routed here, despite FormulaServer exposing something similar:
 
 * ``get_trading_dates`` — FormulaServer wants a *stock code* (``000001.SZ``);
   passing a market (``SH``) silently returns ``[]``. Our callers pass markets.
+* ``get_instrument`` / ``get_instrument_detail`` — getInstrumentDetail here
+  answers the daily reference fields (TotalVolume, OpenDate) with zeros or
+  stale snapshots on the Guojin build while the bridge's ContextInfo path
+  answers correctly (#392). Contract metadata is a record of reference data,
+  not a quote; it reads through the bridge.
 * ``get_divid_factors`` / ``get_risk_free_rate`` — parameter semantics differ
   (range vs single date, index vs timetag). A wrong calendar or dividend factor
   is worse than a slow one.
+  Re-measured 2026-09-04 after someone (me) tried to route it anyway, on the
+  grounds that it is 40x faster and raises nothing: asked for 000001.SZ on
+  20260612 and on 20251015, FormulaServer returned the SAME record both
+  times -- ``{673113600000: [0.3, 0.4, ...]}``, a 1991 timestamp -- while the
+  bridge correctly answered 0.36 and 0.236 for those two ex-dividend days.
+  Speed and a clean return prove nothing about the answer; check the value.
 * Adjusted bars — see :func:`_market_data_params`; ``dividendType`` appears to
   be ignored by the server, so only unadjusted requests are routed.
 
@@ -390,14 +401,6 @@ class FormulaServerClient(object):
 # ---------------------------------------------------------------------------
 # Method mapping
 # ---------------------------------------------------------------------------
-# FormulaServer misspells two instrument fields relative to the xtdata SDK
-# (``FloatVolume``/``TotalVolume``). Downstream code reads the SDK spelling, so
-# alias them rather than let the lookup silently miss.
-_INSTRUMENT_ALIASES = (
-    ("FloatVolumn", "FloatVolume"),
-    ("TotalVolumn", "TotalVolume"),
-)
-
 
 def _first(params, names, default=None):
     for name in names:
@@ -420,21 +423,6 @@ def _require_code(params, names):
     if not text:
         raise ValueError("a stock code is required (one of %s)" % ", ".join(names))
     return text
-
-
-def _instrument_params(params):
-    return {"strOptionCode": _require_code(params, ("code", "stock_code", "stockcode"))}
-
-
-def _instrument_result(raw, params):
-    detail = (raw or {}).get("result")
-    if not isinstance(detail, dict):
-        return detail or {}
-    out = dict(detail)
-    for wire_name, sdk_name in _INSTRUMENT_ALIASES:
-        if wire_name in out and sdk_name not in out:
-            out[sdk_name] = out[wire_name]
-    return out
 
 
 def _scalar_result(raw, params):
@@ -486,11 +474,38 @@ def _weight_in_index_params(params):
     return {"indexCode": str(index_code), "stockCode": str(stock_code)}
 
 
+# What FormulaServer actually answers with data, measured against a live
+# terminal. It accepts ANY field name and returns a column either way -- the
+# ones outside this set come back as all-NaN, which looks like an answer and
+# is not:
+#
+#     field_list=[...11 names...]  0.015s  preClose=nan   suspendFlag=nan
+#     field_list=[]                (RPC)   preClose=9.0   suspendFlag=0
+#
+# Same shape, same column count, twelve times faster, silently wrong. The four
+# it cannot serve are daily metadata (settelementPrice, openInterest, preClose,
+# suspendFlag) rather than bar data, which is why they are missing here.
+#
+# A whitelist, not a blacklist: an unfamiliar field name goes to RPC and is
+# merely slow. Guessing that it might be served risks being quietly wrong,
+# which is the failure this guard exists to remove.
+SERVED_FIELDS = frozenset((
+    "open", "high", "low", "close", "volume", "amount", "time", "stime",
+))
+
+
 def _market_data_params(params):
     fields = _as_list(_first(params, ("field_list", "fields"), None))
     codes = _as_list(_first(params, ("stock_list", "stock_code", "stockCodes"), None))
     if not fields or not codes:
         raise ValueError("field_list and stock_list are required")
+    unservable = sorted(set(str(field) for field in fields) - SERVED_FIELDS)
+    if unservable:
+        # Same rule as the dividend_type guard below: a request this path
+        # cannot answer honestly goes to RPC instead of coming back as NaN.
+        raise ValueError(
+            "field(s) %s come back as NaN here; RPC has the real values"
+            % ", ".join(unservable))
     dividend_type = str(params.get("dividend_type") or "none").lower()
     # FormulaServer returns byte-identical bars for dividendType none/front, so
     # adjustment is not applied here. Serving an adjusted request from this path
@@ -502,6 +517,11 @@ def _market_data_params(params):
     # 数据明明在本地却读到 0 行（issue #66）。拒绝路由，让 RPC 桥回答。
     if period == "tick" or period.startswith("l2"):
         raise ValueError("period=%s is not served by FormulaServer" % period)
+    # synth_fallback_only（#237）是桥端的诊断开关：FormulaServer 没有这个概念，
+    # 照常回答就会让「回落路径通了」看起来成立，而回落根本没跑。拒绝路由。
+    if str(params.get("synth_fallback_only") or "").strip().lower() not in (
+            "", "0", "false", "no", "none"):
+        raise ValueError("synth_fallback_only is served by the RPC bridge only")
     count = params.get("count", -1)
     try:
         count = int(count)
@@ -562,9 +582,15 @@ def _market_data_result(raw, params):
 
 # our RPC method -> (FormulaServer func, param builder, result adapter)
 METHOD_MAP = {
-    "get_instrument": ("getInstrumentDetail", _instrument_params, _instrument_result),
-    "get_instrumentdetail": ("getInstrumentDetail", _instrument_params, _instrument_result),
-    "get_instrument_detail": ("getInstrumentDetail", _instrument_params, _instrument_result),
+    # get_instrument / get_instrument_detail / get_instrumentdetail used to
+    # map to getInstrumentDetail here. Removed in #392: on the Guojin build
+    # FormulaServer answers the daily reference fields dishonestly --
+    # TotalVolume 0 for 43% of a 300-code sample, OpenDate 0 for 32%, and
+    # 22% non-zero but stale (up to 87.7% off) -- while the RPC path
+    # (ContextInfo.get_instrument_detail) answered all 300 correctly. A
+    # well-formed answer whose values are wrong is worse than no answer,
+    # and the result adapter cannot tell stale from true, so these read
+    # through the bridge like every other record of reference data.
     "get_last_volume": ("getLastVolume", _last_volume_params, _scalar_result),
     "get_total_share": ("getTotalShare", _total_share_params, _scalar_result),
     "get_contract_multiplier": ("getContractMultiplier", _contract_multiplier_params, _scalar_result),
@@ -572,6 +598,11 @@ METHOD_MAP = {
     "get_weight_in_index": ("getWeightInIndex", _weight_in_index_params, _scalar_result),
     "get_stock_list_in_sector": ("getStockListInSector", _sector_params, _list_result),
     "get_market_data_ex": ("getMarketData", _market_data_params, _market_data_result),
+    # Same bars, different contract: get_market_data documents
+    # dict[field]->wide-frame, which the client pivots after this answers.
+    # Routing it here takes a 500+-code read off the QMT strategy thread
+    # (repeated RPC timeouts, 2026-09-10 report).
+    "get_market_data": ("getMarketData", _market_data_params, _market_data_result),
 }
 
 SUPPORTED_METHODS = tuple(sorted(METHOD_MAP))

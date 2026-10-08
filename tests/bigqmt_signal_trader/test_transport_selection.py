@@ -18,18 +18,38 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_resolve_background_threads("default", False))
         self.assertFalse(_resolve_background_threads(None, False))
 
-    def test_zmq_transport_forces_background_threads_on(self):
-        # ZMQ must run its background router thread regardless of config —
-        # without it, requests are never received (start_receiving(False)
-        # only binds the socket, never polls it).
-        self.assertTrue(_resolve_background_threads("zmq", False))
-        self.assertTrue(_resolve_background_threads("ZMQ", False))
+    def test_zmq_transport_defaults_to_the_adjust_drain(self):
+        # None = the local config never named rpc_background_threads (the
+        # runtime only forwards the key when explicit). #343: that means the
+        # drain now -- a router thread pays a tick per GIL acquisition
+        # (deferred query 490ms vs 88ms measured live). An explicit True is
+        # still honoured.
+        self.assertFalse(_resolve_background_threads("zmq", None))
+        self.assertFalse(_resolve_background_threads("ZMQ", None))
         self.assertTrue(_resolve_background_threads("zmq", True))
 
-    def test_other_non_redis_transports_force_background_threads_on(self):
-        for name in ("mysql", "shm"):
-            self.assertTrue(_resolve_background_threads(name, False), name)
-            self.assertTrue(_resolve_background_threads(name, True), name)
+    def test_zmq_explicit_false_opts_into_adjust_drain(self):
+        # An explicit rpc_background_threads=False selects the adjust-driven
+        # drain: drain_request_queue polls the bound socket with a non-blocking
+        # recv on each adjust tick, so requests ARE received without the
+        # router thread -- and the round trip drops its cross-thread GIL
+        # handoffs (~1 adjust tick each, #104).
+        self.assertFalse(_resolve_background_threads("zmq", False))
+        self.assertFalse(_resolve_background_threads("ZMQ", False))
+
+    def test_mysql_explicit_false_opts_into_adjust_drain(self):
+        # mysql also implements drain_request_queue, so the override stands.
+        self.assertFalse(_resolve_background_threads("mysql", None))
+        self.assertFalse(_resolve_background_threads("mysql", False))
+        self.assertTrue(_resolve_background_threads("mysql", True))
+
+    def test_drainless_transports_ignore_the_override(self):
+        # shm has no drain_request_queue: without the receiver thread requests
+        # would never be picked up, so even an explicit False cannot turn it
+        # off here.
+        self.assertTrue(_resolve_background_threads("shm", None))
+        self.assertTrue(_resolve_background_threads("shm", False))
+        self.assertTrue(_resolve_background_threads("shm", True))
 
     def test_is_redis_transport(self):
         for name in ("redis", "", "default", None, "REDIS", "Default"):

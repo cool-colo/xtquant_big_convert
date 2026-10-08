@@ -78,6 +78,15 @@ BIGQMT_FULL_TICK_CACHE_CONFIG = {
     "cache_ttl_seconds": 10,
     "wait_seconds": 3.5,
 }
+
+# 保持 True 以还原 MiniQMT 的历史数据行为：先下载原始数据，
+# 再通过 get_local_data(..., dividend_type="front_ratio") 读取前复权数据。
+BIGQMT_LOCAL_CACHE_CONFIG = {
+    "enabled": True,
+    "dir": None,
+    "fallback_rpc": True,
+    "format": "auto",
+}
 ```
 
 然后启动前只需要确认本仓库的 `src` 在 `PYTHONPATH` 最前面：

@@ -19,6 +19,13 @@ _CONFIG = {}
 _QMT_API = {}
 _RUNTIME = None
 
+# How long a shutdown waits for the external strategy to collect its result
+# before releasing the port anyway. Long enough for a client parked in
+# next_bar to be told `done` and come back for finish() (two round trips on a
+# loopback socket), short enough that a client which walked away does not
+# strand the fixed port for the next run (issue #109).
+_STOP_GRACE_SECONDS = 10.0
+
 
 def configure(**kwargs):
     _CONFIG.update(kwargs)
@@ -119,6 +126,12 @@ def _is_qmt_backtest(context):
     return False
 
 
+# What ContextInfo.get_history_data actually serves (API reference 5.2).
+# Anything outside this set produces an ERROR line in QMT's log rather than a
+# quiet miss, so it must never be probed (issue #109).
+HISTORY_DATA_FIELDS = frozenset(("open", "high", "low", "close", "quoter"))
+
+
 class QmtBarExtractor(object):
     def __init__(self):
         self.previous_close = {}
@@ -160,7 +173,47 @@ class QmtBarExtractor(object):
                 result.append(text)
         return result
 
+    def _market_data_ex_value(self, context, field):
+        """The recommended getter (API reference 5.2, 主推接口).
+
+        get_history_data is marked 不推荐 there and QMT logs a deprecation
+        notice for it, which is what a reporter saw first (issue #109).
+        """
+        getter = getattr(context, "get_market_data_ex", None)
+        if not callable(getter):
+            return None
+        symbol = self._symbol(context)
+        for period in self._periods(context):
+            try:
+                frame = (getter([field], [symbol], period=period, count=1)
+                         or {}).get(symbol)
+            except Exception:
+                continue
+            if frame is None:
+                continue
+            try:
+                column = frame[field]
+            except Exception:
+                continue
+            value = _last_value(column)
+            if value not in (None, ""):
+                return value
+        return None
+
     def _history_value(self, context, field):
+        # get_history_data serves exactly open/high/low/close/quoter (API
+        # reference 5.2). Asking it for anything else is not a miss, it is an
+        # ERROR line in QMT's own log -- one per field, per period, per bar:
+        #
+        #     [系统]ERROR获取历史数据,不支持'prev_close'数据字段
+        #     [系统]ERROR获取历史数据,不支持'preClose'数据字段
+        #     [系统]ERROR获取历史数据,不支持'lastClose'数据字段
+        #
+        # which is what issue #109 reported. The probe was guaranteed to fail
+        # for those names, and prev_close is derived from the previous bar's
+        # close anyway, so there was never anything to gain by asking.
+        if field not in HISTORY_DATA_FIELDS:
+            return None
         getter = getattr(context, "get_history_data", None)
         if not callable(getter):
             return None
@@ -179,11 +232,16 @@ class QmtBarExtractor(object):
         return None
 
     def _field(self, context, field, aliases=()):
-        for name in (field,) + tuple(aliases):
+        names = (field,) + tuple(aliases)
+        for name in names:
             value = _last_value(getattr(context, name, None))
             if value not in (None, ""):
                 return value
-        for name in (field,) + tuple(aliases):
+        for name in names:
+            value = self._market_data_ex_value(context, name)
+            if value not in (None, ""):
+                return value
+        for name in names:
             value = self._history_value(context, name)
             if value not in (None, ""):
                 return value
@@ -520,6 +578,21 @@ class QmtNativeBacktestSession(object):
             self._condition.notify_all()
             return self._result_unlocked()
 
+    def wait_for_result_collected(self, timeout_seconds):
+        """Block until the external strategy has called finish(), or time out.
+
+        The shutdown path uses this to hand the client its ending before the
+        socket goes away (issue #150). finish() notifies, so in the normal case
+        this returns as soon as the client has its result.
+        """
+        with self._condition:
+            if self.finished:
+                return True
+            if not self.started:
+                return False        # nobody ever attached; nothing to wait for
+            return bool(self._condition.wait_for(
+                lambda: self.finished, timeout=timeout_seconds))
+
     def _result_unlocked(self):
         return {
             "schema_version": 1,
@@ -634,6 +707,8 @@ class QmtBacktestBridgeRuntime(object):
     def __init__(self, config=None, qmt_api=None):
         config = dict(config or {})
         bind_endpoint = str(config.pop("bind_endpoint", "tcp://127.0.0.1:16662"))
+        self.stop_grace_seconds = float(
+            config.pop("stop_grace_seconds", _STOP_GRACE_SECONDS))
         self.engine = QmtNativeBacktestSession(config=config, qmt_api=qmt_api)
         self.protocol = BacktestBridgeProtocol(self.engine)
         self.server = ZmqBacktestServer(self.protocol, endpoint=bind_endpoint, exit_on_finish=True)
@@ -650,7 +725,12 @@ class QmtBacktestBridgeRuntime(object):
         )
         self.server_thread.start()
         if not self.server.wait_until_ready(5.0) or not self.server.actual_endpoint:
-            raise RuntimeError("QMT native backtest ZMQ service failed to bind")
+            reason = self.server.bind_error
+            raise RuntimeError(
+                "QMT native backtest ZMQ service failed to bind %s%s"
+                % (self.server.endpoint,
+                   ": %s. A previous run may still hold the port -- stop it, "
+                   "or wait a moment and start again" % reason if reason else ""))
         print(
             "[bigqmt_backtest] QMT native service started run_id=%s endpoint=%s account=%s live_ready=False"
             % (self.engine.config.run_id, self.server.actual_endpoint, self.engine.config.account_id)
@@ -668,8 +748,29 @@ class QmtBacktestBridgeRuntime(object):
     def on_qmt_stop(self):
         self.engine.on_qmt_stop()
 
-    def stop_server(self):
+    def wait_for_client_result(self, timeout_seconds=None):
+        """Give a running client time to read ``done`` and collect finish().
+
+        Bounded on purpose: a client that walked away must not strand the
+        port (issue #109). Returns True only if the client actually collected.
+        """
+        if timeout_seconds is None:
+            timeout_seconds = self.stop_grace_seconds
+        return self.engine.wait_for_result_collected(timeout_seconds)
+
+    def stop_server(self, timeout_seconds=5.0):
+        """Stop serving and wait for the port to be released.
+
+        Without the wait, a re-run binds while the previous socket is still
+        open and fails with EADDRINUSE -- the endpoint is a fixed port, so
+        there is no fallback to a free one (issue #109).
+        """
         self.server.stop()
+        thread = self.server_thread
+        if thread is not None and thread.is_alive():
+            self.server.wait_until_stopped(timeout_seconds)
+            thread.join(timeout_seconds)
+        self.server_thread = None
 
 
 def reset_runtime():
@@ -710,8 +811,23 @@ def deal_callback(ContextInfo, dealInfo):
 
 
 def stop(ContextInfo=None):
+    """QMT calls this when the strategy is stopped -- including the stop
+    button next to the chart.
+
+    This used to tell the engine and leave the ZMQ service running, so the
+    port stayed bound to a strategy that was no longer there and the next
+    run failed to bind (issue #109).
+    """
     if _RUNTIME is not None:
         _RUNTIME.on_qmt_stop()
+        # Hand the client its ending before the socket goes away. on_qmt_stop
+        # wakes a next_bar parked in wait_for, but that reply still has to
+        # travel back over ZMQ, and run() calls finish() immediately after it
+        # breaks on `done` -- tearing down first loses both, and the client
+        # sees "backtest ZMQ request timed out: next_bar" at the end of a run
+        # that actually completed (issue #150).
+        _RUNTIME.wait_for_client_result()
+        _RUNTIME.stop_server()
 
 
 def after_backtest(ContextInfo=None):

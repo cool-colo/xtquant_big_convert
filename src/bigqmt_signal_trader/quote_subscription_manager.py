@@ -1,9 +1,12 @@
-"""Reference-counted whole-quote subscription manager (server side).
+"""Reference-counted quote subscription manager (server side).
 
-One big-QMT ``ContextInfo.subscribe_whole_quote`` subscription is shared by every
-client that asked for the same (normalized) code combination. The big-QMT
-subscription is only created for the first client of a combination and only torn
-down after the last client either unsubscribes or goes silent (keepalive timeout).
+One big-QMT subscription group is shared by every client that asked for the same
+(normalized) code combination. Normal instruments use
+``ContextInfo.subscribe_whole_quote``. Explicit .SHO/.SZO option contracts use
+``ContextInfo.subscribe_quote(result_type="list")`` because some full Big-QMT
+versions do not push those contracts through the whole-quote API. The group is
+only created for the first client and only torn down after the last client either
+unsubscribes or goes silent (keepalive timeout).
 
 The manager talks to big QMT exclusively through a :class:`QuoteSourceAdapter`;
 it never touches ``ContextInfo`` directly so the real-environment wiring (method
@@ -18,16 +21,52 @@ publish never stalls quote-thread state, and no callback can deadlock.
 
 import threading
 
+from .code_utils import normalize_stock_code
+
+
+def normalize_subscription_code(code):
+    """One code as big QMT wants it -- and futures keep their case (#95).
+
+    This used to be a plain ``.upper()``, which is right for the exchange
+    tokens (SH / SZ / IF ...) and wrong for every futures contract, because
+    those symbols are lowercase: ``cu2610.SF`` went to QMT as ``CU2610.SF``,
+    a contract it does not have, so the subscription produced no pushes at
+    all. The reporter saw exactly that -- ``CF701.ZF`` ticking every 250ms
+    while ``cu2610.SF`` delivered one frame and then nothing. The one frame
+    was the initial snapshot, which takes the case-preserving get_full_tick
+    path; the subscription behind it was already dead.
+
+    normalize_stock_code keeps the caller's symbol verbatim for the
+    case-sensitive suffixes (.SF .DF .IF .ZF .INE .GF -- issue #58) but
+    rejects a bare exchange token, so tokens are handled here instead.
+    """
+    text = str(code or "").strip()
+    if not text:
+        return ""
+    if "." not in text:
+        return text.upper()          # exchange token: SH / SZ / BJ / IF / SF ...
+    try:
+        return normalize_stock_code(text)
+    except Exception:
+        return text.upper()
+from .quote_utils import is_option_code, latest_quote_batch
+
 
 def combo_key(code_list):
     """Normalize a code list into an order-independent combination key.
 
-    Uppercases, strips whitespace, drops empties and duplicates, sorts. So
-    ``["SH","SZ"]``, ``["sz","sh"]`` and ``["SH","SH","SZ"]`` all map to
-    ``"SH,SZ"`` and share one big-QMT subscription.
+    Strips whitespace, drops empties and duplicates, sorts. Exchange tokens are
+    uppercased, so ``["SH","SZ"]``, ``["sz","sh"]`` and ``["SH","SH","SZ"]``
+    all map to ``"SH,SZ"`` and share one big-QMT subscription.
+
+    Contract codes keep their case, because big QMT does: ``cu2610.SF`` and
+    ``CU2610.SF`` are not the same subscription there -- only one of them
+    exists -- so collapsing them into one key would hand the wrong string to
+    the exchange (#95).
     """
-    normalized = {str(code).strip().upper() for code in (code_list or []) if str(code or "").strip()}
-    return ",".join(sorted(normalized))
+    normalized = {normalize_subscription_code(code) for code in (code_list or [])
+                  if str(code or "").strip()}
+    return ",".join(sorted(normalized - {""}))
 
 
 class QuoteSourceAdapter(object):
@@ -45,26 +84,73 @@ class QuoteSourceAdapter(object):
 class ContextInfoQuoteSource(QuoteSourceAdapter):
     """Real big-QMT source backed by the strategy's ``ContextInfo``.
 
-    Verified against the real environment: ``ContextInfo.subscribe_whole_quote(
-    code_list, callback)`` returns an int subscription id (``< 0`` on failure) and
-    pushes INCREMENTAL ``{code: tick}`` batches on a dedicated quote thread;
-    ``ContextInfo.unsubscribe_quote(sub_id)`` cancels it.
+    Verified against the real environment: ``ContextInfo.subscribe_whole_quote``
+    returns an int subscription id and pushes ``{code: tick}`` batches. Explicit
+    option contracts are subscribed one-by-one with ``subscribe_quote`` and the
+    safe ``result_type='list'`` wrapper; its column arrays are collapsed to the
+    newest tick before publishing. ``unsubscribe_quote`` cancels either handle.
     """
 
     def __init__(self, context_info):
         self._context = context_info
 
     def subscribe(self, codes, on_push):
-        sub_id = self._context.subscribe_whole_quote(list(codes), callback=on_push)
-        if sub_id is None or int(sub_id) < 0:
-            raise RuntimeError("ContextInfo.subscribe_whole_quote failed for codes=%s" % (list(codes),))
-        return int(sub_id)
+        codes = list(codes)
+        option_codes = [code for code in codes if is_option_code(code)]
+        whole_codes = [code for code in codes if not is_option_code(code)]
+        handles = []
+
+        def checked_handle(sub_id, method, method_codes):
+            try:
+                value = int(sub_id)
+            except (TypeError, ValueError):
+                value = -1
+            if value <= 0:
+                raise RuntimeError(
+                    "ContextInfo.%s failed for codes=%s" % (method, list(method_codes))
+                )
+            return value
+
+        try:
+            if whole_codes:
+                sub_id = self._context.subscribe_whole_quote(
+                    whole_codes, callback=on_push
+                )
+                handles.append(checked_handle(
+                    sub_id, "subscribe_whole_quote", whole_codes
+                ))
+
+            def on_option_push(data):
+                batch = latest_quote_batch(data)
+                if batch:
+                    on_push(batch)
+
+            for code in option_codes:
+                sub_id = self._context.subscribe_quote(
+                    code, "tick", "none", "list", on_option_push
+                )
+                handles.append(checked_handle(
+                    sub_id, "subscribe_quote", [code]
+                ))
+        except Exception:
+            for handle in handles:
+                try:
+                    self._context.unsubscribe_quote(handle)
+                except Exception:
+                    pass
+            raise
+
+        if not handles:
+            raise RuntimeError("no quote codes supplied")
+        return handles[0] if len(handles) == 1 else tuple(handles)
 
     def unsubscribe(self, handle):
-        try:
-            self._context.unsubscribe_quote(handle)
-        except Exception:
-            pass
+        handles = handle if isinstance(handle, (list, tuple, set)) else [handle]
+        for sub_id in handles:
+            try:
+                self._context.unsubscribe_quote(sub_id)
+            except Exception:
+                pass
 
 
 class _Combo(object):
@@ -108,7 +194,8 @@ class QuoteSubscriptionManager(object):
         with self._lock:
             combo = self._combos.get(key)
             if combo is None:
-                codes = sorted({str(c).strip().upper() for c in (code_list or []) if str(c or "").strip()})
+                codes = sorted({normalize_subscription_code(c) for c in (code_list or [])
+                                if str(c or "").strip()} - {""})
                 # source.subscribe registers the on_push callback with big QMT; it
                 # does not call back into the manager, so it is safe under the lock.
                 handle = self._source.subscribe(codes, self._make_on_push(key))
@@ -166,6 +253,49 @@ class QuoteSubscriptionManager(object):
             self._close_source(handle)
         return reaped
 
+    # -- diagnostics / force-clear ---------------------------------------------
+    def status(self):
+        """Read-only snapshot of what is subscribed and how fresh it is.
+
+        The report is the diagnostic for "I lost my seq and something is still
+        pushing": which combos exist, how many clients each thinks it has, and
+        how long since the freshest keepalive. A combo whose silence exceeds
+        the heartbeat timeout but has not been reaped yet is about to die;
+        one that stays fresh has a live keepalive feeding it (a leftover
+        client process, not a leak).
+        """
+        with self._lock:
+            now = self._now()
+            combos = []
+            for combo in self._combos.values():
+                latest = max(combo.clients.values()) if combo.clients else None
+                combos.append({
+                    "topic": combo.topic,
+                    "codes": list(combo.codes),
+                    "clients": len(combo.clients),
+                    "last_seen_seconds_ago": round(now - latest, 1) if latest is not None else None,
+                })
+            return {"heartbeat_timeout_seconds": self._heartbeat_timeout, "combos": combos}
+
+    def unsubscribe_all(self):
+        """Tear every combo down NOW, without needing any seq.
+
+        The operator kill switch for a subscription whose seq is lost. Every
+        source handle is closed, so big QMT stops pushing even for a combo
+        whose clients are still sending keepalives -- they will recreate the
+        combo on their next keepalive... no, keepalive is a no-op on unknown
+        sub_ids, so a force-cleared combo stays down until someone subscribes
+        again. Returns how many combos were closed.
+        """
+        with self._lock:
+            combos = list(self._combos.values())
+            count = len(combos)
+            self._combos = {}
+            self._sub_index = {}
+        for combo in combos:
+            self._close_source(combo.handle)
+        return count
+
     # -- internals -------------------------------------------------------------
     def _make_on_push(self, key):
         def on_push(data):
@@ -221,24 +351,38 @@ def build_quote_subscription_service(
     enabled=True,
     heartbeat_timeout_seconds=30.0,
     time_func=None,
+    account_ids=None,
 ):
     """Assemble the server-side whole-quote service: a ContextInfo-backed source,
     a push channel matching the RPC transport, and a QuoteSubscriptionManager
     wired so big-QMT pushes publish to the channel. Returns ``(manager, channel)``
     or ``None`` when disabled. The caller starts the channel publisher and feeds
-    ``manager.reap_expired`` from the scheduler loop."""
+    ``manager.reap_expired`` from the scheduler loop.
+
+    ``account_ids``: every account this bridge serves. None reads
+    ``BIGQMT_ACCOUNT_TYPE_MAP`` (the single-instance multi-account table,
+    #315), so a secondary account's client gets the push on ITS channel."""
     if not enabled:
         return None
-    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+    from .quote_push_channel import (
+        NullQuotePushChannel, RedisQuotePushChannel, ZmqQuotePushChannel,
+    )
 
     source = ContextInfoQuoteSource(context_info)
     transport_name = str(transport_name or "redis").lower()
+    served = _served_account_ids(account_id, account_ids)
     if transport_name == "zmq":
         bind_address = zmq_bind_address or _default_quote_push_zmq_bind(account_id)
-        channel = ZmqQuotePushChannel(bind_address=bind_address)
+        extra = [_default_quote_push_zmq_bind(other) for other in served if other != str(account_id or "")]
+        channel = ZmqQuotePushChannel(bind_address=bind_address, extra_bind_addresses=extra)
         push_endpoint = bind_address
+    elif redis_client is None:
+        # pipe（或 redis 被关掉的部署）没有推送线——静默空通道，而不是
+        # RedisQuotePushChannel(None) 每条事件一行 AttributeError。
+        channel = NullQuotePushChannel()
+        push_endpoint = ""
     else:
-        channel = RedisQuotePushChannel(redis_client, account_id=account_id)
+        channel = RedisQuotePushChannel(redis_client, account_id=account_id, account_ids=served)
         push_endpoint = ""
     manager = QuoteSubscriptionManager(
         source,
@@ -248,6 +392,24 @@ def build_quote_subscription_service(
         push_endpoint=push_endpoint,
     )
     return manager, channel
+
+
+def _served_account_ids(primary_account_id, account_ids=None):
+    """The accounts a push must reach: the primary plus, by default, every
+    key of BIGQMT_ACCOUNT_TYPE_MAP. Order: primary first, then the map's."""
+    if account_ids is None:
+        try:
+            from .account_type_map import get_account_type_map
+
+            account_ids = list(get_account_type_map() or {})
+        except Exception:
+            account_ids = []
+    served = []
+    for value in [primary_account_id] + list(account_ids):
+        text = str(value or "")
+        if text and text not in served:
+            served.append(text)
+    return served
 
 
 def _default_quote_push_zmq_bind(account_id):
