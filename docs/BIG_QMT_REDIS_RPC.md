@@ -9,6 +9,7 @@
 - `ping`
 - `get_ticks`
 - `get_instrument`
+- `get_all_instruments`
 - `get_market_data` / `get_market_data_ex` / `get_local_data`
 - `get_stock_list_in_sector` / `get_sector_list` / `get_sector_info`
 - `get_divid_factors` / `download_history_data` / `download_history_data2`
@@ -406,4 +407,3 @@ python -B -m unittest discover -s tests\bigqmt_signal_trader
 Ran 68 tests
 OK
 ```
-

@@ -31,6 +31,10 @@ def get_instrumentdetail(stock_code):
     return _compat.xtdata.get_instrumentdetail(stock_code)
 
 
+def get_all_instruments():
+    return _compat.xtdata.get_all_instruments()
+
+
 def get_instrument_type(stock_code, variety_list=None):
     return _compat.xtdata.get_instrument_type(stock_code, variety_list)
 

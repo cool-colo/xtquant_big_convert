@@ -26,13 +26,14 @@ from .models import AccountSnapshot, OrderRef, OrderRequest
 _monotonic = time.monotonic
 
 
-RPC_REVISION = "20260715-execution-snapshot-v1"
+RPC_REVISION = "20261009-all-instruments-v1"
 
 
 READ_METHODS = {
     "ping",
     "get_ticks",
     "get_instrument",
+    "get_all_instruments",
     "get_instrument_type",
     "get_market_data",
     "get_market_data_ex",
@@ -589,6 +590,23 @@ class BigQmtRpcHandlers:
         if not code:
             raise ValueError("code is required")
         return self.market_data.get_instrument(code)
+
+    def _handle_get_all_instruments(self, params):
+        """Return every Shanghai/Shenzhen A-share instrument in one RPC.
+
+        The individual ContextInfo calls intentionally happen in the QMT
+        process.  This keeps a remote client from paying one Redis round trip
+        per stock, which dominates runtime on a high-latency/low-bandwidth
+        link.
+        """
+        codes = self.market_data.get_stock_list_in_sector("沪深A股") or []
+        instruments = {}
+        for code in codes:
+            code = str(code or "").strip()
+            if not code or code in instruments:
+                continue
+            instruments[code] = self.market_data.get_instrument(code) or {}
+        return instruments
 
     def _handle_market_data_method(self, method, params):
         handler = getattr(self.market_data, method, None)

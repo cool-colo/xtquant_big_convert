@@ -12,7 +12,7 @@
 | 类别 | 方法数 | 说明 |
 |------|-------|------|
 | 系统 | 1 | `ping` |
-| 行情快照 | 2 | `get_ticks` / `get_instrument` |
+| 行情快照 | 3 | `get_ticks` / `get_instrument` / `get_all_instruments` |
 | 行情/K线/基本面（转发适配器）| 84 | 见下表 |
 | 账户/持仓/委托 | 5 | `get_asset` / `get_positions` / `query_stock_position` / `query_orders` / `query_trades` |
 | 交易扩展查询（官方函数）| 13 | `get_value_by_order_id` / `get_last_order_id` / `get_ipo_data` / `get_new_purchase_limit` / `get_history_trade_detail_data` / 融资融券5个 / 期权持仓2个 / 港股通汇率 |
@@ -61,6 +61,12 @@
 - **参数**：`code`（str，必填）：股票代码
 - **返回**：`dict`，合约详情（名称、上市日、合约乘数、最小变动价位等约 30 个字段）。
 - **实现**：`ContextInfo.get_instrumentdetail(code)`。
+
+### `get_all_instruments`
+- **参数**：无
+- **返回**：`dict[code -> instrument detail]`，包含“沪深A股”板块内的全部股票。
+- **实现**：服务端先调用 `ContextInfo.get_stock_list_in_sector("沪深A股")`，再在 QMT 进程内逐只调用 `ContextInfo.get_instrumentdetail(code)`，最终通过一次 RPC 返回。
+- **用途**：避免远程客户端为 5000 多只股票产生 5000 多次 Redis 往返。兼容层可直接调用 `xtdata.get_all_instruments()`；该大响应使用至少 60 秒客户端超时。
 
 ---
 
