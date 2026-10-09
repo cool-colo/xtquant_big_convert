@@ -856,6 +856,13 @@ class BigQmtXtData:
             "get_all_instruments", {}, timeout_seconds=timeout
         ) or {}
 
+    def get_all_instrument_details(self):
+        """Fetch all Shanghai/Shenzhen A-share details in one RPC call."""
+        timeout = max(float(getattr(self.client, "timeout_seconds", 6.0)), 60.0)
+        return self.client.call(
+            "get_all_instrument_details", {}, timeout_seconds=timeout
+        ) or {}
+
     def get_instrument_type(self, stock_code, variety_list=None):
         return self._call("get_instrument_type", code=stock_code, variety_list=variety_list)
 

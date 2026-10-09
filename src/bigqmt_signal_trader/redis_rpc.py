@@ -26,7 +26,7 @@ from .models import AccountSnapshot, OrderRef, OrderRequest
 _monotonic = time.monotonic
 
 
-RPC_REVISION = "20261009-all-instruments-v1"
+RPC_REVISION = "20261009-all-instrument-details-v1"
 
 
 READ_METHODS = {
@@ -162,6 +162,7 @@ METHOD_ALIASES = {
     "get_full_tick": "get_ticks",
     "get_instrument_detail": "get_instrument",
     "get_instrumentdetail": "get_instrument",
+    "get_all_instrument_details": "get_all_instruments",
     "getDividFactors": "get_divid_factors",
     "query_stock_asset": "get_asset",
     "query_stock_positions": "get_positions",

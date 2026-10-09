@@ -63,10 +63,11 @@
 - **实现**：`ContextInfo.get_instrumentdetail(code)`。
 
 ### `get_all_instruments`
+- **别名**：`get_all_instrument_details`
 - **参数**：无
 - **返回**：`dict[code -> instrument detail]`，包含“沪深A股”板块内的全部股票。
 - **实现**：服务端先调用 `ContextInfo.get_stock_list_in_sector("沪深A股")`，再在 QMT 进程内逐只调用 `ContextInfo.get_instrumentdetail(code)`，最终通过一次 RPC 返回。
-- **用途**：避免远程客户端为 5000 多只股票产生 5000 多次 Redis 往返。兼容层可直接调用 `xtdata.get_all_instruments()`；该大响应使用至少 60 秒客户端超时。
+- **用途**：避免远程客户端为 5000 多只股票产生 5000 多次 Redis 往返。兼容层可调用 `xtdata.get_all_instruments()` 或 `xtdata.get_all_instrument_details()`；该大响应使用至少 60 秒客户端超时。
 
 ---
 

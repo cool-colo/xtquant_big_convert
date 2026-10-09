@@ -373,6 +373,19 @@ class RedisRpcTest(unittest.TestCase):
         self.assertEqual(set(result), {"600000.SH", "000001.SZ"})
         self.assertEqual(result["600000.SH"]["code"], "600000.SH")
 
+    def test_get_all_instrument_details_is_batch_alias(self):
+        market_data = FakeMarketData()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=market_data,
+            position_provider=FakePositionProvider(),
+        )
+
+        result = handlers.handle("get_all_instrument_details", {})
+
+        self.assertEqual(market_data.instrument_codes, ["600000.SH", "000001.SZ"])
+        self.assertEqual(set(result), {"600000.SH", "000001.SZ"})
+
     def test_execution_snapshot_queries_orders_and_all_trades_once(self):
         gateway = CapturingExecutionGateway()
         handlers = BigQmtRpcHandlers(
