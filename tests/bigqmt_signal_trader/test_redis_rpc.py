@@ -49,11 +49,19 @@ class FakeRedis:
 
 
 class FakeMarketData:
+    def __init__(self):
+        self.instrument_codes = []
+
     def get_ticks(self, codes):
         return {codes[0]: {"lastPrice": 10.5}}
 
     def get_instrument(self, code):
+        self.instrument_codes.append(code)
         return {"code": code, "InstrumentStatus": 0}
+
+    def get_stock_list_in_sector(self, sector_name, real_timetag=-1):
+        self.sector_request = (sector_name, real_timetag)
+        return ["600000.SH", "000001.SZ", "600000.SH", ""]
 
     def get_market_data_ex(self, **kwargs):
         return {"params": kwargs, "data": {"600000.SH": {"close": [10.0]}}}
@@ -607,6 +615,34 @@ class AsyncOrderSettlementTest(unittest.TestCase):
 
 
 class RedisRpcTest(unittest.TestCase):
+    def test_get_all_instruments_batches_a_share_details_on_server(self):
+        market_data = FakeMarketData()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=market_data,
+            position_provider=FakePositionProvider(),
+        )
+
+        result = handlers.handle("get_all_instruments", {})
+
+        self.assertEqual(market_data.sector_request, ("沪深A股", -1))
+        self.assertEqual(market_data.instrument_codes, ["600000.SH", "000001.SZ"])
+        self.assertEqual(set(result), {"600000.SH", "000001.SZ"})
+        self.assertEqual(result["600000.SH"]["code"], "600000.SH")
+
+    def test_get_all_instrument_details_is_batch_alias(self):
+        market_data = FakeMarketData()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=market_data,
+            position_provider=FakePositionProvider(),
+        )
+
+        result = handlers.handle("get_all_instrument_details", {})
+
+        self.assertEqual(market_data.instrument_codes, ["600000.SH", "000001.SZ"])
+        self.assertEqual(set(result), {"600000.SH", "000001.SZ"})
+
     def test_execution_snapshot_queries_orders_and_all_trades_once(self):
         gateway = CapturingExecutionGateway()
         handlers = BigQmtRpcHandlers(

@@ -138,6 +138,16 @@ class FakeRpcClient:
             return {codes[0]: {"lastPrice": 10, "bidPrice": [9.9], "askPrice": [10.1]}}
         if method == "get_instrument_detail":
             return {"InstrumentStatus": 0, "code": params.get("code")}
+        if method == "get_all_instruments":
+            return {
+                "600000.SH": {"InstrumentStatus": 0, "InstrumentName": "浦发银行"},
+                "000001.SZ": {"InstrumentStatus": 0, "InstrumentName": "平安银行"},
+            }
+        if method == "get_all_instrument_details":
+            return {
+                "600000.SH": {"InstrumentStatus": 0, "InstrumentName": "浦发银行"},
+                "000001.SZ": {"InstrumentStatus": 0, "InstrumentName": "平安银行"},
+            }
         if method == "get_market_data_ex":
             if params.get("stock_list") == ["159518.SZ"]:
                 try:
@@ -422,6 +432,25 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(detail["InstrumentStatus"], 0)
         self.assertEqual(sector_codes, ["000001.SZ", "300001.SZ", "600000.SH"])
         self.assertEqual(market_data["600000.SH"]["close"], [10.0])
+
+    def test_get_all_instruments_uses_one_rpc_with_extended_timeout(self):
+        xtdata = self._xtdata()
+
+        instruments = xtdata.get_all_instruments()
+
+        self.assertEqual(instruments["600000.SH"]["InstrumentName"], "浦发银行")
+        self.assertEqual(xtdata.client.calls, [("get_all_instruments", {}, None, 60.0)])
+
+    def test_get_all_instrument_details_uses_one_rpc_with_extended_timeout(self):
+        xtdata = self._xtdata()
+
+        instruments = xtdata.get_all_instrument_details()
+
+        self.assertEqual(instruments["600000.SH"]["InstrumentName"], "浦发银行")
+        self.assertEqual(
+            xtdata.client.calls,
+            [("get_all_instrument_details", {}, None, 60.0)],
+        )
 
     def test_market_data_ex_normalizes_bigqmt_stime_to_miniqmt_shape(self):
         try:

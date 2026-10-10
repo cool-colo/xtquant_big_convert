@@ -9,6 +9,7 @@
 - `ping`
 - `get_ticks`
 - `get_instrument`
+- `get_all_instruments`
 - `get_market_data` / `get_market_data_ex` / `get_local_data`
 - `get_stock_list_in_sector` / `get_sector_list` / `get_sector_info`
 - `get_divid_factors` / `download_history_data` / `download_history_data2`
@@ -37,6 +38,7 @@ RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 | `query_stock_trades` | `query_trades` | 查询成交 |
 | `get_full_tick` | `get_ticks` | 默认直接 RPC 调用；可选开启 Redis 快照缓存降载 |
 | `get_instrument_detail` / `get_instrumentdetail` | `get_instrument` | 查询合约详情 |
+| `get_all_instrument_details` | `get_all_instruments` | 批量查询全部沪深 A 股合约详情 |
 | `order_stock` / `order_stock_async` | `submit_order` | 买卖下单；默认关闭 |
 | `cancel_order_stock` / `cancel_order_stock_sysid` | `cancel_order` | 撤单；默认关闭 |
 
@@ -444,4 +446,3 @@ python -B -m unittest discover -s tests\bigqmt_signal_trader
 Ran 68 tests
 OK
 ```
-
