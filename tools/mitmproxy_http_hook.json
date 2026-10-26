@@ -1,0 +1,16 @@
+{
+  "targets": [
+    {
+      "host": "127.0.0.1",
+      "port": 8080,
+      "path": "/download/update36.cfg",
+      "response_file": "responses/update36.cfg",
+      "response_status": 200,
+      "response_headers": {
+        "Content-Type": "text/plain"
+      },
+      "request_target": true,
+      "record_dir": "recordings"
+    }
+  ]
+}
