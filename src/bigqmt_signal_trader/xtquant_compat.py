@@ -312,6 +312,20 @@ def _build_quote_push_channel(client):
     if transport_name in ("zmq",):
         address = _quote_push_zmq_address(client)
         return ZmqQuotePushChannel(connect_address=address)
+    if transport_name in ("pipe",):
+        # #408: the events pipe path derives from the RPC pipe block exactly
+        # as the server derives it -- no discovery needed. An explicit redis
+        # block keeps winning (config is an opt-in): the pipe channel is the
+        # no-redis default precisely because a named pipe is not a socket and
+        # cannot trip the connection-killing sandbox the gate guards.
+        if not getattr(client, "_redis_explicit", False):
+            from .transports.pipe_push_channel import (
+                PipeQuotePushChannel, pipe_events_path,
+            )
+
+            pipe_config = dict(getattr(client, "pipe_config", {}) or {})
+            address = pipe_events_path(pipe_config.get("pipe_name"), client.account_id)
+            return PipeQuotePushChannel(connect_address=address)
     if (transport_name not in ("redis", "", "default")
             and not getattr(client, "_redis_explicit", True)):
         raise RuntimeError(
@@ -931,6 +945,14 @@ def _digits_only(value):
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
+def _time_compare_digits(value):
+    """A 14-digit string so QMT timestamps compare chronologically."""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not digits:
+        return ""
+    return digits[:14].ljust(14, "0")
+
+
 def _parse_qmt_stime(value):
     digits = _digits_only(value)
     if len(digits) >= 14:
@@ -1468,6 +1490,7 @@ class BigQmtRpcClient:
         ).lower()
         self.zmq_config = dict(merged_redis_config.get("zmq") or {})
         self.mysql_config = dict(merged_redis_config.get("mysql") or {})
+        self.pipe_config = dict(merged_redis_config.get("pipe") or {})
         self._transport_instance = None  # lazily built by _transport()
         # FormulaServer read fast-path. QMT's C++ quote service (port 58600)
         # answers reference/history reads in ~0.07ms without touching the QMT
@@ -1533,6 +1556,24 @@ class BigQmtRpcClient:
                 print_prefix="[bigqmt_client]",
             )
         return self._transport_instance
+
+    def close(self):
+        """Release the swappable transport's connections, if one was built.
+
+        The transport is built lazily and otherwise lives until process exit:
+        every per-thread pipe connection it opened stays up, and a pipe
+        connection costs the server a worker thread each (#431). Called by
+        ``BigQmtXtTrader.stop()``; xtdata-only clients that want the same
+        teardown can call it directly. Safe to call more than once -- the
+        transport is rebuilt lazily if the client is used again afterwards.
+        """
+        transport = self._transport_instance
+        self._transport_instance = None
+        if transport is not None:
+            try:
+                transport.stop()
+            except Exception:
+                pass
 
     def _formula_router(self):
         """Lazily build the FormulaServer router. Never raises — a router that
@@ -1934,6 +1975,7 @@ RESYNTH_PERIOD_STARTS = {
     "1y": _year_start_label,
 }
 _RESYNTH_NOTICE = {"shown": False}
+_DAILY_RESCUE_NOTICE = {"shown": False}
 
 
 def _in_trading_session(now):
@@ -2459,7 +2501,7 @@ class BigQmtXtData:
         return True
 
     def _backfill_pre_close(self, data, period, dividend_type,
-                            timeout_seconds=None, use_formula=True):
+                            timeout_seconds=None, use_formula=True, subscribe=None):
         """Fill an all-zero preClose from daily bars (#166).
 
         Big QMT answers preClose = 0.0 on every ``1w`` bar. The right value,
@@ -2497,7 +2539,7 @@ class BigQmtXtData:
                 # A filled row carries no real preClose and would be picked as
                 # a period's "first trading day" if it were returned (#167).
                 fill_data=False, timeout_seconds=timeout_seconds,
-                use_formula=use_formula, backfill_pre_close=False,
+                use_formula=use_formula, backfill_pre_close=False, subscribe=subscribe,
             )
         except Exception as exc:
             # Degrade to the terminal's answer. The bars themselves are good;
@@ -2553,7 +2595,7 @@ class BigQmtXtData:
 
     def _resynth_ongoing_multiday_bars(self, data, period, start_time,
                                        end_time, dividend_type,
-                                       timeout_seconds=None, use_formula=True):
+                                       timeout_seconds=None, use_formula=True, subscribe=None):
         """Rebuild the in-progress multi-day bar from the period's daily bars (#226).
 
         Big QMT synthesizes an ongoing 1w/1mon/1q/1hy/1y bar from the bars in
@@ -2642,7 +2684,7 @@ class BigQmtXtData:
                 start_time=first, end_time=today, count=-1,
                 dividend_type=dividend_type, fill_data=False,
                 timeout_seconds=timeout_seconds, use_formula=use_formula,
-                backfill_pre_close=False, resynth_ongoing_multiday=False,
+                backfill_pre_close=False, resynth_ongoing_multiday=False, subscribe=subscribe,
             )
         except Exception as exc:
             # The terminal's answer was good enough to serve; taking the whole
@@ -2675,6 +2717,81 @@ class BigQmtXtData:
         if rebuilt or appended:
             self._notice_resynth_ongoing(period, rebuilt + appended, appended)
         return data
+
+    def _rescue_ongoing_daily_bar(self, data, period, end_time, dividend_type,
+                                  timeout_seconds=None):
+        """Append today's forming 1d bar when the read stops at the previous
+        trading day (#226/#307 family, the 1d case).
+
+        The live daily read carries today's partial bar mid-session (measured
+        on 2.1.33 intraday), but two read paths lose it: a client-cache frame
+        written before today's session -- nothing between
+        download_history_data2 and this read refreshes the cache -- and, on
+        some terminals, a local-store read right after an incremental
+        download. Same guards as the multiday resynth (weekday inside
+        09:15..15:05, a request whose window still covers today) and the same
+        degrade: a failed or empty live read keeps the original answer and
+        warns once. The appended row lives in the returned frame only; it is
+        never written back into the cache.
+        """
+        if str(period or "") != "1d" or not isinstance(data, dict) or not data:
+            return data
+        now = _now()
+        if not _in_trading_session(now):
+            return data
+        today = now.strftime("%Y%m%d")
+        end_day = _digits_only(str(end_time or ""))[:8]
+        if end_day and end_day < today:
+            return data          # a pure-history window never asked for today
+        wanted = []
+        for code, frame in data.items():
+            labels = _frame_bar_labels(frame) if frame is not None else None
+            if not labels or str(labels[-1]) < today:
+                wanted.append(code)
+        if not wanted:
+            return data
+        try:
+            live = self.get_market_data_ex(
+                field_list=["open", "high", "low", "close", "volume", "amount"],
+                stock_list=wanted, period="1d",
+                start_time=today, end_time=today, count=-1,
+                dividend_type=dividend_type, fill_data=False,
+                timeout_seconds=timeout_seconds, use_formula=False,
+                backfill_pre_close=False, resynth_ongoing_multiday=False,
+            )
+        except Exception as exc:
+            # The local answer was good enough to serve; taking the whole
+            # read down over the appended bar would be the worse bug.
+            log.warning("ongoing 1d bar rescue skipped: %s", exc)
+            return data
+        appended = 0
+        for code in wanted:
+            live_frame = live.get(code) if isinstance(live, dict) else None
+            summary = self._sum_daily_bars(live_frame, today, today)
+            if summary is None:
+                continue          # no live bar yet (pre-open): nothing to add
+            if self._append_ongoing_bar(data[code], today, summary):
+                appended += 1
+        if appended:
+            self._notice_1d_rescue(appended)
+        return data
+
+    @staticmethod
+    def _notice_1d_rescue(appended):
+        """Say once that today's forming daily bar was appended here."""
+        if _DAILY_RESCUE_NOTICE["shown"]:
+            return
+        _DAILY_RESCUE_NOTICE["shown"] = True
+        try:
+            log.info(
+                "%d forming 1d bar(s) missing from the local answer were "
+                "appended from the live daily read (#226/#307 family, the 1d "
+                "case): a client-cache frame cached before the session or a "
+                "store read right after an incremental download stops at the "
+                "previous trading day. Pass resynth_ongoing_multiday=False to "
+                "serve the raw answer.", appended)
+        except Exception:
+            pass
 
     @staticmethod
     def _last_bar_disagrees(frame, summary):
@@ -2908,7 +3025,7 @@ class BigQmtXtData:
             # rather than a copy of the zeros (#166).
             data = self._backfill_pre_close(
                 data, period=period, dividend_type=dividend_type,
-                timeout_seconds=timeout_seconds, use_formula=use_formula,
+                timeout_seconds=timeout_seconds, use_formula=use_formula, subscribe=subscribe,
             )
 
         if resynth_ongoing_multiday:
@@ -2917,7 +3034,7 @@ class BigQmtXtData:
             data = self._resynth_ongoing_multiday_bars(
                 data, period=period, start_time=start_time, end_time=end_time,
                 dividend_type=dividend_type, timeout_seconds=timeout_seconds,
-                use_formula=use_formula,
+                use_formula=use_formula, subscribe=subscribe,
             )
 
         cache = self._local_cache()
@@ -2925,8 +3042,8 @@ class BigQmtXtData:
             for code, df in data.items():
                 try:
                     cache.write(code, period, df, dividend_type=dividend_type)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("local cache write failed code=%s period=%s: %s", code, period, exc)
         return data
 
     def get_local_data(
@@ -2986,6 +3103,19 @@ class BigQmtXtData:
                         end_time=end_time, dividend_type=dividend_type,
                     )
                 data = payload.get(single) if single is not None else payload
+            if resynth_ongoing_multiday and str(period or "") == "1d":
+                # The 1d twin of the block above: a forming daily bar the
+                # local answer dropped is appended from the live read. The
+                # single-code frame gets the same wrap/unwrap treatment.
+                single = None
+                payload = data
+                if not isinstance(data, dict) and codes:
+                    single = codes[0]
+                    payload = {single: data}
+                payload = self._rescue_ongoing_daily_bar(
+                    payload, period=period, end_time=end_time,
+                    dividend_type=dividend_type)
+                data = payload.get(single) if single is not None else payload
             if isinstance(data, dict):
                 return {code: _ensure_kline_columns(frame, field_list=field_list, period=period)
                         for code, frame in data.items()}
@@ -3013,6 +3143,13 @@ class BigQmtXtData:
                             field_list=fields, period=period),
                         fields,
                     )
+        if result and resynth_ongoing_multiday and str(period or "") == "1d":
+            # The cache branch is where a stale frame bites: a file written
+            # before today's session serves all day with the last bar at the
+            # previous trading day, and downloads never refresh it.
+            result = self._rescue_ongoing_daily_bar(
+                result, period=period, end_time=end_time,
+                dividend_type=dividend_type)
         return result
 
     @staticmethod
@@ -3499,6 +3636,44 @@ class BigQmtXtData:
         self._record_subscription(seq, {}, active=False)
         return 0
 
+    def unsubscribe_quotes(self, seqs):
+        """Batch-release whole-quote handles: one RPC, one topic re-sync (#418).
+
+        ``unsubscribe_quote`` per handle costs an RPC plus a subscriber
+        rebuild each -- a 26-handle exit paid 26 RPCs and 25 rebuilds and
+        took seconds. This releases only THIS client's named handles server-
+        side (shared combos stay up for their other subscribers;
+        quote_unsubscribe_all remains the last resort it was). Handles that
+        are K-line pollers keep their per-item semantics (they are local
+        threads, no RPC at all). Returns the server's report: released /
+        unknown / native_errors.
+        """
+        wanted = [s for s in (seqs or [])]
+        session_owned = []
+        session = self._quote_session
+        with self._bar_poller_lock:
+            pollers = []
+            for seq in wanted:
+                poller = self._bar_pollers.pop(seq, None)
+                if poller is not None:
+                    pollers.append((seq, poller))
+                elif session is not None and session.has_subscription(seq):
+                    session_owned.append(seq)
+        for seq, poller in pollers:
+            poller.stop()
+            self._record_subscription(seq, {}, active=False)
+        report = None
+        if session_owned and session is not None:
+            report = session.unsubscribe_quotes(session_owned)
+            for seq in session_owned:
+                self._record_subscription(seq, {}, active=False)
+        for seq in wanted:
+            if seq not in session_owned:
+                self._record_subscription(seq, {}, active=False)
+        if report is None:
+            report = {"released": [], "unknown": [], "native_errors": []}
+        return report
+
     def stop_all_subscriptions(self):
         """Stop every K-line poller this object owns. Daemon threads die with
         the process anyway; this is for tests and for callers that recycle a
@@ -3635,6 +3810,7 @@ class BigQmtXtData:
         if step <= 0:
             step = 300
         finished = 0
+        skipped_all = []
         for i in range(0, total, step):
             batch = codes[i:i + step]
             # QMT 的下载全局是「提交任务即返回」，数据在服务端异步落地
@@ -3658,6 +3834,7 @@ class BigQmtXtData:
                     # The RPC timeout for one pull is not the poll budget: a
                     # batch of 300 codes x 20k bars is a multi-second reply.
                     timeout_seconds=max(float(data_wait_seconds), 60.0),
+                    subscribe=False,  # Cache population must not allocate native subscriptions.
                     # 等的就是刚提交的那笔下载。heal 看到「还没落地」会把它原样
                     # 再提交一遍、睡 2 秒、再读——每轮如此，等待目标被反复推后，
                     # 单票冷启动必然打满 60 秒（#275）。轮询里的读不参与 heal。
@@ -3688,14 +3865,73 @@ class BigQmtXtData:
                     "downloaded for these codes" % (
                         period, start_time, end_time, server_download_error,
                         ",".join(missing)))
+            skipped = []
+            if start_time and ready < len(batch):
+                no_data = [code for code in batch
+                           if getattr((data or {}).get(code), "shape", (0,))[0] == 0]
+                skipped = self._download_skipped_dead_zone(
+                    no_data, period, start_time, end_time)
+                if skipped:
+                    skipped_all.extend(skipped)
+                    # #397: the terminal's injected download only appends from
+                    # its local last bar -- these windows ended before it, so
+                    # nothing was written even though the task was accepted.
+                    # Name them instead of reporting fake progress.
+                    log.warning(
+                        "download_history_data2 %s %s~%s: %d code(s) sit in the "
+                        "append-only dead zone (window ends before the terminal's "
+                        "local last bar; nothing was written for them). They are "
+                        "in 'skipped', not 'finished': %s",
+                        period, start_time, end_time, len(skipped),
+                        ",".join(skipped[:5]))
             for code in batch:
+                if code in skipped:
+                    continue
                 finished += 1
                 if callback is not None:
                     try:
                         callback({"finished": finished, "total": total, "stockcode": code})
                     except Exception:
                         pass
-        return {"finished": finished, "total": total}
+        result = {"finished": finished, "total": total}
+        if skipped_all:
+            result["skipped"] = skipped_all
+        return result
+
+    def _download_skipped_dead_zone(self, codes, period, start_time, end_time):
+        """Empty-poll codes that are in the append-only dead zone, not data-less.
+
+        #397: the terminal's injected download only appends from its local
+        last bar; a window ending BEFORE that bar is silently not written.
+        Telling that from a genuinely data-less code (suspended / delisted /
+        never downloaded -- the tolerance those were for) needs one tail read:
+        a code with later data is in the dead zone; a code with none is not.
+        Batched, count=1, heal off -- cheap, and read-only.
+        """
+        if not codes or not start_time:
+            return []
+        try:
+            tails = self.get_market_data_ex(
+                field_list=["close"], stock_list=list(codes), period=period,
+                count=1, dividend_type="none", fill_data=False,
+                heal=False, subscribe=False, timeout_seconds=60.0)
+        except Exception:
+            return []   # cannot tell: keep the old tolerant finish
+        end_digits = _time_compare_digits(end_time)
+        if not end_digits:
+            return []
+        skipped = []
+        for code in codes:
+            frame = (tails or {}).get(code)
+            if frame is None or getattr(frame, "shape", (0,))[0] == 0:
+                continue
+            try:
+                last_stamp = str(list(frame.index)[-1])
+            except Exception:
+                continue
+            if _time_compare_digits(last_stamp) > end_digits:
+                skipped.append(code)
+        return skipped
 
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
         return self.download_history_data2([stock_code], period, start_time, end_time, dividend_type=dividend_type)
@@ -4643,6 +4879,13 @@ class BigQmtXtTrader:
         if thread is not None and thread.is_alive():
             thread.join(1.0)
         self._event_thread = None
+        # The trader built its client in __init__, so it owns the transport
+        # too: without this, every per-thread pipe connection lives until
+        # process exit, and each one costs the server a worker thread (#431).
+        try:
+            self.client.close()
+        except Exception:
+            pass
         return 0
 
     def _start_event_listener(self):
@@ -4893,16 +5136,17 @@ class BigQmtXtTrader:
             redis_client = self._exec_events_redis_or_none()
             if redis_client is not None:
                 self._event_loop_redis(redis_client)
-            elif self._exec_transport_is_zmq():
+            elif self._exec_transport_uses_push_channel():
                 self._event_loop_push_channel()
             else:
-                # pipe / mysql 没有推送通道（redis 传输的 redis 宕了也是）——
+                # mysql 没有推送通道（redis 传输的 redis 宕了也是）——
                 # 查询 RPC 还通，就轮询合成回调（#372）；查询也连续失败时
                 # 它会自己退回来，外层重新探 redis。
                 self._event_loop_poll()
 
-    def _exec_transport_is_zmq(self):
-        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() == "zmq"
+    def _exec_transport_uses_push_channel(self):
+        # zmq and pipe both carry exec events on their push channel (#76, #408).
+        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() in ("zmq", "pipe")
 
     def _exec_events_redis_or_none(self):
         """A REACHABLE Redis client for the exec-event channels, or None.
@@ -5117,6 +5361,20 @@ class BigQmtXtTrader:
             m_dTotalAsset=_safe_float(total_asset, 0.0) if total_asset is not None else None,
             m_dMarketValue=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
         )
+
+    def query_secu_account(self, account):
+        """query_stock_asset 的别名（#406）。
+
+        不在 xtquant 公开文档里，但光大 2.1.29 终端在下单校验与账户会话探测
+        链上会按属性名回调 trader 对象的 query_secu_account；缺这个属性时
+        AttributeError 直接把当前操作打断（实盘下单被迫人工兜底、清算后每
+        5 分钟一条报错）。账户信息探针要的就是这份资产答案
+        （cash / frozen / market_value / total_asset）。
+        """
+        return self.query_stock_asset(account)
+
+    def query_secu_account_async(self, account, callback=None):
+        return self._async_query(self.query_secu_account, account, callback)
 
     def _position_object(self, account_id, item):
         volume = _safe_int(item.get("volume"))

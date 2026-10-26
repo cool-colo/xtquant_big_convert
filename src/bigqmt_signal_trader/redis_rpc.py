@@ -19,7 +19,9 @@ import uuid
 
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
+from . import exec_events as _exec_events
 from .models import AccountSnapshot, OrderRef, OrderRequest
+from . import order_identity_journal as _identity_journal
 
 
 # time.monotonic: unaffected by wall-clock jumps, so a settle deadline
@@ -131,6 +133,7 @@ ORDER_METHODS = {
 QUOTE_SUBSCRIPTION_METHODS = {
     "subscribe_whole_quote",
     "unsubscribe_whole_quote",
+    "unsubscribe_whole_quote_batch",
     "quote_keepalive",
     "quote_unsubscribe_all",
 }
@@ -486,6 +489,28 @@ def to_jsonable(value):
             return str(value)
     if hasattr(value, "to_dict") and hasattr(value, "columns") and hasattr(value, "index"):
         try:
+            columns = value.columns
+            if getattr(columns, "nlevels", 1) > 1:
+                # Python 3.12 QMT terminals answer the multi-stock forms of
+                # get_financial_data / get_top10_share_holder / get_market_data
+                # with a MultiIndex DataFrame where pandas.Panel used to be
+                # (pandas removed Panel in 1.0; the 3.12 runtime ships 3.0).
+                # reset_index()/to_dict below would flatten the tuple column
+                # labels into strings -- "('000002.SZ', 'close')" -- and the
+                # client would rebuild a frame it cannot index by code. Slice
+                # by the first level instead and reuse the Panel envelope,
+                # whose client rebuild is {code: DataFrame}: the same
+                # df[code] sub-table shape both pandas generations serve.
+                codes = list(columns.get_level_values(0).unique())
+                return {
+                    "__bigqmt_type__": "Panel",
+                    "items": [str(code) for code in codes],
+                    "major_axis": [str(item) for item in list(value.index)],
+                    "minor_axis": [
+                        str(item) for item in list(columns.get_level_values(1).unique())
+                    ],
+                    "data": {str(code): to_jsonable(value[code]) for code in codes},
+                }
             frame = value.reset_index()
             return {
                 "__bigqmt_type__": "DataFrame",
@@ -693,8 +718,9 @@ class BigQmtRpcHandlers:
         # at submit time and read back at query time. The Redis identity store
         # covers restarts and other processes; this covers deployments with no
         # Redis at all (zmq single-file), where attribution used to silently
-        # read "" forever (issue #156 follow-up to #133). Bounded FIFO,
-        # same 24h TTL as the Redis store.
+        # read "" forever (issue #156 follow-up to #133). The runtime enables
+        # a disk journal for Redis-free deployments before serving requests.
+        # Bounded FIFO, same seven-day TTL as the Redis store.
         self._order_identity_local = collections.OrderedDict()
         # Settled-id journal (#299 follow-up): remark -> OrderedDict of the
         # order_sys_ids already handed out for it, insertion-ordered. The
@@ -1582,6 +1608,16 @@ class BigQmtRpcHandlers:
         manager.unsubscribe(client_id, sub_id)
         return {}
 
+    def _handle_unsubscribe_whole_quote_batch(self, params):
+        """Release many sub_ids in one RPC (#418): per-item release cost N
+        RPCs plus N push-subscriber rebuilds on the client."""
+        manager = self._require_quote_manager()
+        client_id = str(params.get("client_id") or "")
+        sub_ids = params.get("sub_ids") or params.get("sub_id") or []
+        if isinstance(sub_ids, (str, int)):
+            sub_ids = [sub_ids]
+        return manager.unsubscribe_batch(client_id, [str(s) for s in sub_ids])
+
     def _handle_quote_keepalive(self, params):
         manager = self._require_quote_manager()
         client_id, sub_id, _codes = self._quote_params(params)
@@ -1788,6 +1824,7 @@ class BigQmtRpcHandlers:
             self._request_account_id(params),
             str(params.get("strategy_name") or ""),
         )
+        orders = self._recover_order_remarks(self._request_account_id(params), orders)
         if _bool_value(params.get("cancelable_only"), False):
             orders = [
                 order
@@ -1808,8 +1845,15 @@ class BigQmtRpcHandlers:
         account_id = self._request_account_id(params)
         return self._attribute_to_strategies(
             account_id,
-            self.order_gateway.query_trades(account_id, str(strategy_name)),
+            self._recover_order_remarks(
+                account_id, self.order_gateway.query_trades(account_id, str(strategy_name))),
         )
+
+    def _recover_order_remarks(self, account_id, snapshots):
+        return _exec_events.recover_order_remarks(
+            getattr(self, "order_remark_redis_client", None), account_id,
+            self._configured_account_type(account_id), snapshots,
+            _exec_events.ORDER_IDENTITY_TTL_SECONDS)
 
     def _attribute_to_strategies(self, account_id, snapshots):
         """Put the caller's strategy name on rows this bridge submitted.
@@ -1828,6 +1872,7 @@ class BigQmtRpcHandlers:
         name. Rows without a remark (hand-placed orders) or without an
         identity record (another process's orders) keep the row's value.
         """
+        self._load_order_identity_journal(account_id)
         rows = list(snapshots or [])
         candidates = [row for row in rows
                       if str(getattr(row, "user_order_id", "") or "").strip()]
@@ -1871,12 +1916,50 @@ class BigQmtRpcHandlers:
     # renamed under the bridge process (#393).
     _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 7 * 86400.0
 
+    def enable_order_identity_persistence(self, directory=None, account_types=None):
+        """Restore Redis-free attribution before the RPC service starts."""
+        from .account_type_map import get_account_type_map, primary_account_type
+
+        self._order_identity_journals = {}
+        self._order_identity_journal_directory = directory
+        if account_types is None:
+            account_types = dict(get_account_type_map())
+        account_types = dict(account_types)
+        account_types.setdefault(self.account_id, self._configured_account_type(self.account_id))
+        for account_id in account_types:
+            self._load_order_identity_journal(
+                account_id, primary_account_type(account_types[account_id]))
+
+    def _load_order_identity_journal(self, account_id, account_type=None):
+        stores = getattr(self, "_order_identity_journals", None)
+        if stores is None:
+            return None
+        account_id = str(account_id or "")
+        if account_id in stores:
+            return stores[account_id]
+        store = _identity_journal.OrderIdentityJournal(
+            account_id,
+            self._configured_account_type(account_id) if account_type is None else account_type,
+            directory=self._order_identity_journal_directory,
+            ttl_seconds=self._ORDER_IDENTITY_LOCAL_TTL_SECONDS,
+            limit=self._ORDER_IDENTITY_LOCAL_LIMIT)
+        stores[account_id] = store
+        journal = self._order_identity_local
+        for key, entry in store.load().items():
+            existing = journal.get(key)
+            if existing is None or (entry[1] and not existing[1]):
+                journal[key] = entry
+        while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
+            journal.popitem(last=False)
+        return store
+
     def _remember_order_identity_local(self, account_id, remark, strategy_name):
         remark = str(remark or "").strip()
         if not remark:
             return
         key = (str(account_id or ""), remark)
         try:
+            store = self._load_order_identity_journal(account_id)
             journal = getattr(self, "_order_identity_local", None)
             if journal is None:
                 # Tests (and the QMT sandbox) build handlers via __new__ and
@@ -1884,7 +1967,8 @@ class BigQmtRpcHandlers:
                 journal = self._order_identity_local = collections.OrderedDict()
             name = str(strategy_name or "")
             existing = journal.get(key)
-            if existing is not None:
+            now = time.time()
+            if existing is not None and now - existing[0] <= self._ORDER_IDENTITY_LOCAL_TTL_SECONDS:
                 existing_name = existing[1]
                 if existing_name and existing_name != name:
                     # First NAMED record wins (#393): a reused remark must
@@ -1899,10 +1983,12 @@ class BigQmtRpcHandlers:
                               % (remark, existing_name, name))
                     journal.move_to_end(key)
                     return
-            journal[key] = (time.time(), name)
+            journal[key] = (now, name)
             journal.move_to_end(key)
             while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
                 journal.popitem(last=False)
+            if store is not None:
+                store.remember(account_id, remark, now, name)
         except Exception:
             pass
 
@@ -1967,12 +2053,17 @@ class BigQmtRpcHandlers:
         trade_name = params.get("trade_strategy_name")
         if trade_name is None:
             trade_name = ""
+        orders = self.order_gateway.query_orders(account_id, str(order_name))
+        trades = self.order_gateway.query_trades(account_id, str(trade_name))
+        # Observe both native sets before filling ANY blanks. A DEAL can reveal
+        # a missing association, or invalidate one an earlier ORDER would use.
+        rows = self._recover_order_remarks(account_id, list(orders) + list(trades))
         return {
             "account_id": account_id,
             "server_time": _dt.datetime.now(),
             "rpc_revision": RPC_REVISION,
-            "orders": self.order_gateway.query_orders(account_id, str(order_name)),
-            "trades": self.order_gateway.query_trades(account_id, str(trade_name)),
+            "orders": rows[:len(orders)],
+            "trades": rows[len(orders):],
         }
 
     def _handle_sync_positions(self, params):
@@ -2326,12 +2417,23 @@ class BigQmtRpcHandlers:
         # strDatatype, startDate, endDate)（6.9）。原来漏了 strAccountType，
         # 于是 detail_type 被塞进了账户类型的位置 —— 少一个参数、还错位，
         # 和 #96 里 get_ipo_data 把 account_id 当 type 传是同一个形状（#207）。
-        result = self._call_qmt_global(
-            "get_history_trade_detail_data", account_id,
-            self._configured_account_type(account_id),
-            detail_type, start_date, end_date
-        )
-        return result
+        #
+        # NOT _call_qmt_global (#395): that helper's "unavailable -> []" and
+        # exception-swallowing are right for the credit lookups, but here they
+        # made three different worlds indistinguishable -- function not bound,
+        # native raise, and a genuinely empty history all answered
+        # ok=True data=[]. History is a record of facts: unavailable must be
+        # an error, and a native failure must propagate.
+        func = self.qmt_api.get("get_history_trade_detail_data")
+        if func is None:
+            raise RuntimeError(
+                "get_history_trade_detail_data is not bound on this terminal "
+                "(probe_capabilities.qmt_globals shows it false). An empty "
+                "answer here would read as 'no history', which is not the "
+                "same thing (#395)")
+        raw = func(account_id, self._configured_account_type(account_id),
+                   detail_type, start_date, end_date)
+        return _normalize_grouped_detail_rows(raw)
 
     def _handle_get_assure_contract(self, params):
         return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
@@ -2493,6 +2595,13 @@ class BigQmtRpcHandlers:
             "identity_redis_wired": redis_client is not None,
             "local_journal_size": len(journal),
         }
+        store = self._load_order_identity_journal(account_id)
+        if store is not None:
+            out["local_persistence_enabled"] = True
+            out["local_persistence_directory"] = store.directory
+            out["local_persistence_error"] = store.error
+            journal = self._order_identity_local
+            out["local_journal_size"] = len(journal)
         if not remark:
             out["note"] = "pass remark=<the order's remark> to check the key"
             return out
@@ -2502,7 +2611,10 @@ class BigQmtRpcHandlers:
         out["identity_key"] = key
         if redis_client is not None:
             try:
-                out["redis_hit"] = bool(redis_client.get(key))
+                identity = _exec_events._read_order_identity(redis_client, account_id, remark)
+                out["redis_hit"] = bool(identity)
+                if identity:
+                    out["redis_strategy_name"] = str(identity.get("strategy_name") or "")
             except Exception as exc:
                 out["redis_hit"] = None
                 out["lookup_error"] = "%s: %s" % (exc.__class__.__name__, exc)
@@ -2673,22 +2785,29 @@ class BigQmtRpcHandlers:
             print("%s 直接还款: amount=%d taken from order_volume; price=%r is ignored "
                   "by passorder (#330)" % ("[bigqmt_rpc]", request.volume, request.price))
 
+        identity = None
+        identity_redis = self._identity_redis()
         try:
-            from .exec_events import remember_order_identity
-
-            remember_order_identity(
-                self._identity_redis(),
+            identity = _exec_events.remember_order_identity(
+                identity_redis,
                 request.account_id,
                 request.remark,
                 strategy_name=request.strategy_name,
                 stock_code=request.stock_code,
             )
-        except Exception:
-            pass
+            if identity is None and identity_redis is not None:
+                # A repeated remark retained an existing record. A fresh
+                # process must cache THAT name, or its new local journal
+                # would override Redis and rename the old order again.
+                identity = _exec_events._read_order_identity(
+                    identity_redis, request.account_id, request.remark)
+        except Exception as exc:
+            _exec_events._warn_order_identity(exc)
         # Always journal locally too -- cheap, and the only attribution a
         # no-Redis deployment has (issue #156).
         self._remember_order_identity_local(
-            request.account_id, request.remark, request.strategy_name)
+            request.account_id, request.remark,
+            (identity or {}).get("strategy_name") or request.strategy_name)
 
         # Taken before passorder so every callback / row this order produces
         # is at or after it; an entry from an earlier same-remark order is
@@ -3352,12 +3471,10 @@ class BigQmtRpcHandlers:
             settlement.result.message = ""
             return True
         if status in TERMINAL_NON_CANCEL_ORDER_STATUSES:
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel was not confirmed: order %s reached status %s"
-                % (order_sys_id, status)
-            )
-            return True
+                % (order_sys_id, status))
         if status in CANCEL_IN_FLIGHT_STATUSES:
             if not final:
                 return False
@@ -3374,12 +3491,52 @@ class BigQmtRpcHandlers:
             return True
         if not final:
             return False
-        settlement.result.success = False
-        settlement.result.message = (
+        return self._fail_cancel_settlement(
+            settlement,
             "cancel was not confirmed after %d lookup(s): order %s is still status %s"
-            % (settlement.attempts, order_sys_id, status or "unknown")
-        )
+            % (settlement.attempts, order_sys_id, status or "unknown"))
+
+    def _fail_cancel_settlement(self, settlement, message):
+        """Settle a cancel as FAILED and push a cancel_error event (#389).
+
+        QMT logs a refused cancel (已成不可撤 etc.) but fires NO callback for
+        it: a strategy that listens on on_cancel_error never learns, and
+        keeps re-cancelling a dead order. The bridge's own settle path is the
+        one place that concludes the failure (status looked up against the
+        order snapshot), so the push is synthesized here and rides the same
+        channel as native order/trade events.
+        """
+        settlement.result.success = False
+        settlement.result.message = message
+        self._publish_cancel_error(settlement, message)
         return True
+
+    def _publish_cancel_error(self, settlement, message):
+        hook = getattr(self, "exec_event_publisher", None)
+        if not callable(hook):
+            # Tests and deployments predating the strategy-side hook have no
+            # channel; the RPC reply still carries the verdict.
+            return
+        try:
+            order_ref = settlement.order_ref
+            order_sys_id = str(getattr(order_ref, "order_sys_id", "") or "")
+            remark = str(getattr(order_ref, "user_order_id", "") or "")
+            event = {
+                "event_type": "cancel_error",
+                "account_id": str(getattr(settlement, "account_id", "") or ""),
+                "stock_code": str(getattr(order_ref, "stock_code", "") or ""),
+                "order_sys_id": order_sys_id,
+                "order_id": order_sys_id,
+                "error_id": None,
+                "order_remark": remark,
+                "user_order_id": remark,
+                "error_msg": str(message or ""),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at_ts": time.time(),
+            }
+            hook(str(getattr(settlement, "account_id", "") or ""), event)
+        except Exception:
+            pass
 
     def _apply_cancel_lookup(self, settlement, final=False):
         """Resolve an ambiguous native cancel return from the order snapshot."""
@@ -3411,12 +3568,10 @@ class BigQmtRpcHandlers:
         except Exception as exc:
             if not final:
                 return False
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel status lookup failed after %d attempt(s): %s: %s"
-                % (settlement.attempts, exc.__class__.__name__, exc)
-            )
-            return True
+                % (settlement.attempts, exc.__class__.__name__, exc))
 
         matches = [
             order for order in orders
@@ -3425,12 +3580,10 @@ class BigQmtRpcHandlers:
         if not matches:
             if not final:
                 return False
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel was not confirmed: order %s was not found after %d lookup(s)"
-                % (order_sys_id, settlement.attempts)
-            )
-            return True
+                % (order_sys_id, settlement.attempts))
 
         status = str(getattr(matches[0], "status", "") or "")
         return self._settle_cancel_from_status(
@@ -3569,6 +3722,40 @@ def _normalize_detail_rows(rows):
                 continue
             item[name] = value
         result.append(item)
+    return result
+
+
+def _jsonable_scalar(value):
+    if value is None or isinstance(value, (int, float, str, bool)):
+        return value
+    return str(value)
+
+
+def _normalize_grouped_detail_rows(rows):
+    """Serialize get_history_trade_detail_data's documented grouped answer.
+
+    The official contract is ``[(timetag, [detail, ...]), ...]`` -- the
+    example iterates ``for time, data in obj_list`` and then the details in
+    ``data``. _normalize_detail_rows alone treats each outer tuple as one
+    detail object: a tuple has no data attributes, so a fully-populated
+    history normalized to [{}], losing both the grouping and every deal in
+    it (#395). Grouped entries become ``{"timetag": t, "details": [...]}``;
+    anything not in the documented shape goes through the flat normaliser so
+    a build that answers flat rows still answers.
+    """
+    if not rows:
+        return []
+    result = []
+    for entry in rows:
+        if (isinstance(entry, (list, tuple)) and len(entry) == 2
+                and isinstance(entry[1], (list, tuple))):
+            timetag, details = entry
+            result.append({
+                "timetag": _jsonable_scalar(timetag),
+                "details": _normalize_detail_rows(details),
+            })
+        else:
+            result.extend(_normalize_detail_rows([entry]))
     return result
 
 

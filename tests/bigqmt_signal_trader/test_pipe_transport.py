@@ -349,12 +349,21 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertEqual(errors[:5], [], "500 次并发里出了 %d 个错" % len(errors))
 
     def test_each_thread_gets_its_own_handle(self):
+        """「各自一条连接」必须在全部连接同时活着时比较。
+
+        #431 之后句柄随线程退出即时关闭，内核句柄值会被回收复用：先死的
+        线程留下的数值，可能被后建的连接原样拿回——那不是共用。旧写法
+        等线程全退出后才比数值，于是把回收复用误判成共享（5 != 6 偶发）。
+        用 barrier 让 6 条连接同时在线再采样，复用就不可能发生。
+        """
+        barrier = threading.Barrier(6)
         seen = []
         lock = threading.Lock()
 
         def grab():
             self.pair.client.send_request(
                 {"request_id": "h", "method": "p", "params": {}}, 5)
+            barrier.wait(timeout=30)          # 6 条连接全部就位、同时活着
             with lock:
                 seen.append(self.pair.client._client_local.handle)
 

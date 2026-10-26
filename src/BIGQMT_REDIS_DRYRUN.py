@@ -166,13 +166,17 @@ def _load_local_module(name):
     # QMT native allowlist rejects the root package eager exports.
     if name == "bigqmt_signal_trader":
         return module
+    source = None
     try:
         with open(source_path, "rb") as source_file:
             source = source_file.read()
         exec(compile(source, source_path, "exec"), module.__dict__)
-    except Exception:
+    except Exception as exc:
         sys.modules.pop(name, None)
-        if _looks_like_a_token_not_python(source):
+        # #420: on builds that forbid strategy FileIO the open() itself raises
+        # (PermissionError: Forbidden FileIO) and `source` never exists --
+        # the token check must not mask that with UnboundLocalError.
+        if source is not None and _looks_like_a_token_not_python(source):
             raise RuntimeError(
                 "%s is not Python source -- its first line is one long token, "
                 "so the file was saved from something other than the code "
@@ -181,6 +185,8 @@ def _load_local_module(name):
                 "xt_trader.sync_deployment(), or copy src/ from the release. "
                 "A different version will not help; every version fails the "
                 "same way on this file." % source_path)
+        print("[bigqmt_shell] load failed: module=%s path=%s error=%s: %s"
+              % (name, source_path, type(exc).__name__, exc))
         raise
     _set_parent_attribute(name, module)
     return module

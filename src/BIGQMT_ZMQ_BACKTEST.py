@@ -129,19 +129,24 @@ def _load_local_module(name):
     sys.modules[name] = module
     if name == _LOCAL_ROOT:
         return module
+    source = None
     try:
         with open(source_path, "rb") as source_file:
             source = source_file.read()
         exec(compile(source, source_path, "exec"), module.__dict__)
-    except Exception:
+    except Exception as exc:
         sys.modules.pop(name, None)
-        if _looks_like_a_token_not_python(source):
+        # #420: FileIO-forbidden builds raise on the open() itself; without
+        # the None guard the token check masks it with UnboundLocalError.
+        if source is not None and _looks_like_a_token_not_python(source):
             raise RuntimeError(
                 "%s is not Python source -- its first line is one long token, "
                 "so the file was saved from something other than the code (a "
                 "download page, or a mirror that served a token). Fetch the "
                 "file again. A different version will not help; every version "
                 "fails the same way on this file." % source_path)
+        print("[bigqmt_shell] load failed: module=%s path=%s error=%s: %s"
+              % (name, source_path, type(exc).__name__, exc))
         raise
     if "." in name:
         parent_name, child_name = name.rsplit(".", 1)
