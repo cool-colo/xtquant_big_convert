@@ -563,6 +563,11 @@ class BigQmtOrderGateway:
         credit_optype = credit_optype_of(raw_order_type)
         passthrough_optype = passthrough_optype_of(raw_order_type)
         convertible_optype = convertible_optype_of(raw_order_type)
+        # Resolved once, reused by the passthrough guard and the plain-trade
+        # translation below (a dict lookup; cheap next to passorder itself).
+        account_type = str(
+            self._resolve_account_type(request.account_id or self.account_id) or ""
+        ).upper()
         if convertible_optype is not None:
             # 转股 / 回售: the number already says which account book it is
             # for (80/81 普通, 82/83 信用). Forward as-is; the caller (or the
@@ -581,7 +586,6 @@ class BigQmtOrderGateway:
             # them. Letting a futures opType fall through to 23/24 on a STOCK
             # account is the #103 failure mode again: 平今多 (a close) would go
             # out as an ordinary stock buy.
-            account_type = str(self._resolve_account_type(request.account_id or self.account_id) or "").upper()
             if account_type not in PASSTHROUGH_ACCOUNT_TYPES:
                 raise ValueError(
                     # ASCII only: this goes to QMT's own log, which drops
@@ -593,9 +597,22 @@ class BigQmtOrderGateway:
                         "/".join(sorted(PASSTHROUGH_ACCOUNT_TYPES))))
             op_type = passthrough_optype
         elif action == SignalAction.BUY.value:
-            op_type = 23
+            # MiniQMT's 23/24 on a credit account ARE collateral buy/sell
+            # (xtconstant: CREDIT_BUY/SELL = 23/24, 担保品买入/卖出), but in
+            # passorder 23/24 are ordinary trades and 33/34 the collateral
+            # opTypes (API ref 10.1). Terminals up to 2.0.8 accepted 23/24 on
+            # a credit account and placed the collateral trade anyway; 2.1.33
+            # takes the ordinary-trade path, where the order silently never
+            # enters the system -- passorder returns, no ORDER row appears,
+            # and the settlement ends at "submitted but order not found"
+            # (measured live, 2026-10-27: the same call with opType 34 lands
+            # in the 委托 list with a 合同号). Send the collateral opType on a
+            # credit account; the client's read-back already maps 33/34 back
+            # to 23/24 (_credit_order_type_for_row), so the round trip is
+            # symmetric and MiniQMT callers see their own numbers.
+            op_type = 33 if account_type == "CREDIT" else 23
         elif action == SignalAction.SELL.value:
-            op_type = 24
+            op_type = 34 if account_type == "CREDIT" else 24
         else:
             raise ValueError("unsupported order action: %s" % request.action)
 

@@ -2,6 +2,47 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.3.78] - 2026-10-27
+
+### 修复
+
+- **同机零依赖传输：drain 模式延迟应答不再可能串到别的连接（#436）**：延迟应答
+  原先按裸句柄值写回——等待方超时断开后，该值可能被回收给一条新连接，旧应答会
+  落到新客户端手里。现在每条连接登记身份 token，应答凭 token 认连接（token 不符
+  即连接已亡：丢弃并记日志）；客户端另加 request_id 核对兜底，串线的应答响亮报错
+  而不是被当成结果。
+- **同机零依赖传输：stop 与 accept 线程的竞态（#436）**：stop 现在先解除
+  ConnectNamedPipe 阻塞、等待 accept 线程退出（限时 5s）、再做二次清扫——快照之后
+  竞态新建的实例不再残留；重跑时同名旧服务实例会被新实例先行停止，客户端不会再
+  连上死实例。注：实现中途把服务注册表锁改为可重入——start 内调 previous.stop 与
+  stop 自注销在同一把锁上同线程重入，非重入锁直接死锁。
+## [0.3.77] - 2026-10-27
+
+### 修复
+
+- **NoopPositionSyncSink 快照无界增长（#441，内存泄漏）**：非 redis 传输回落到
+  Noop sink，publish() 每次追加、永不清理——app.tick() 每个 adjust 拍发布一次
+  （约 10 次/秒），报告者终端实测约 1MB/s 私有内存增长，直到页面文件吃满 C 盘。
+  改为原地保留最新一条（外部引用不变，src 内无历史读取方）。redis 传输用真
+  sink（带 TTL 发布）不受影响。
+## [0.3.76] - 2026-10-27
+
+### 修复
+
+- **信用账户 23/24 提交时翻译为担保品 opType 33/34**：MiniQMT 语义里 CREDIT_BUY/SELL
+  就是 23/24（担保品买卖），但 passorder 的 23/24 是普通买卖、33/34 才是担保品。
+  2.0.8 终端对信用账户的 23/24 宽容地按担保品成交；2.1.33 走普通买卖路径，订单
+  静默不进系统——passorder 返回但无委托行，结算终点报 submitted but order not
+  found（2026-10-27 实测：同参数 opType 改 34 即正常落委托列表带合同号）。现在
+  submit() 对 CREDIT 账户的 23/24 送 33/34，普通账户保持 23/24，两融 27-32 与
+  专项 70-75 翻译不变；客户端读回侧本就把 33/34 译回 23/24，往返对称。
+- **单文件外壳改用 capture_qmt_injected_funcs 捕获 QMT 全局函数**：手抄名单自
+  0.2.12 起停在 get_hkt_exchange_rate，download_history_data /
+  download_history_data2 / down_history_data、query_credit_account 与公式族在
+  所有单文件构建里都没绑定——download RPC 报 no download channel，终端已有
+  数据时被读到的行盖住像下载成功。两个构建器（b64 与 flat）同步改为从策略模块
+  的唯一名单捕获，_singlefile 打包副本同步；反手抄测试覆盖单文件模板。
+
 ## [0.3.75] - 2026-10-26
 
 ### 修复

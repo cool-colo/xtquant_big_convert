@@ -102,5 +102,47 @@ class NoHandCopiedListTest(unittest.TestCase):
         self.assertEqual(sorted(captured), ["passorder"])
 
 
+
+
+# 单文件外壳也是被 QMT 挂载的入口 —— 模板是构建器里的字符串，同样不许手抄。
+# pipe 构建器复用 flat 的 FLAT_TEMPLATE，不单列。
+SINGLE_FILE_TEMPLATES = (
+    os.path.join('tools', 'build_single_file.py'),
+    os.path.join('tools', 'build_no_redis_single_file_flat.py'),
+    os.path.join('src', 'bigqmt_signal_trader', '_singlefile',
+                 'build_single_file.py.txt'),
+    os.path.join('src', 'bigqmt_signal_trader', '_singlefile',
+                 'build_no_redis_single_file_flat.py.txt'),
+)
+
+
+class SingleFileTemplateCaptureTest(unittest.TestCase):
+    """单文件模板从 0.2.12 起手抄了一份停在 get_hkt_exchange_rate 的名单，
+    download_history_data / download_history_data2 / down_history_data、
+    query_credit_account 和公式族全部没绑 —— 客户端 download RPC 报
+    no download channel，终端里已有数据时还会被读到的行盖住，像下载成功。
+    """
+
+    def test_templates_capture_from_the_single_source(self):
+        for relative in SINGLE_FILE_TEMPLATES:
+            self.assertIn(
+                'capture_qmt_injected_funcs', _source(relative),
+                '%s 生成的单文件外壳必须用 capture_qmt_injected_funcs 取名单' % relative)
+
+    def test_no_template_hand_copies_the_name_list(self):
+        offenders = []
+        for relative in SINGLE_FILE_TEMPLATES:
+            text = _source(relative)
+            hits = [name for name in KNOWN_GLOBAL_NAMES
+                    if ('"%s"' % name) in text or ("'%s'" % name) in text]
+            if len(hits) >= 5:
+                offenders.append('%s 手抄了 %d 个全局函数名 %s'
+                                 % (relative, len(hits), sorted(hits)[:4]))
+        self.assertEqual(
+            offenders, [],
+            '单文件模板不许手抄 QMT 全局函数名单 —— 手抄一份就会漂：下载三件套 '
+            '就是这么从 0.2.12 丢到 0.3.75 的。%s' % offenders)
+
+
 if __name__ == "__main__":
     unittest.main()

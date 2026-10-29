@@ -204,5 +204,52 @@ class RpcAcceptanceTest(unittest.TestCase):
         self.assertIn("9999", str(caught.exception))
 
 
+
+
+class CollateralOpTypeForCreditAccountTest(unittest.TestCase):
+    """23/24 on a CREDIT account go out as the collateral opTypes 33/34.
+
+    2.1.33 takes passorder's ordinary-trade path for 23/24 on a credit
+    account and the order never enters the system; up to 2.0.8 the terminal
+    placed the collateral trade anyway (measured live, 2026-10-27).
+    """
+
+    def _submit(self, order_type, action, account_type):
+        recorder = _Recorder()
+        gateway = BigQmtOrderGateway(account_id="acct", passorder_func=recorder,
+                                     context_info=object(),
+                                     account_type=account_type)
+        gateway.submit(OrderRequest(
+            signal_id="s", account_id="acct", stock_code="600000.SH",
+            action=action, volume=100, price=10.0, price_type="LIMIT",
+            strategy_name="s", order_type=order_type))
+        return recorder.op_type
+
+    def test_credit_account_plain_buy_becomes_collateral(self):
+        self.assertEqual(self._submit(None, "BUY", "CREDIT"), 33)
+
+    def test_credit_account_plain_sell_becomes_collateral(self):
+        self.assertEqual(self._submit(None, "SELL", "CREDIT"), 34)
+
+    def test_credit_account_miniqmt_credit_codes_translate(self):
+        # xtconstant CREDIT_BUY/CREDIT_SELL are 23/24 themselves.
+        self.assertEqual(
+            self._submit(xtconstant.CREDIT_BUY, "BUY", "CREDIT"), 33)
+        self.assertEqual(
+            self._submit(xtconstant.CREDIT_SELL, "SELL", "CREDIT"), 34)
+
+    def test_stock_account_unchanged(self):
+        self.assertEqual(self._submit(None, "BUY", "STOCK"), 23)
+        self.assertEqual(self._submit(None, "SELL", "STOCK"), 24)
+        self.assertEqual(self._submit(xtconstant.STOCK_SELL, "SELL", "STOCK"), 24)
+
+    def test_margin_family_not_retouched(self):
+        # 27-32 / 70-75 keep their own translation regardless of account type.
+        self.assertEqual(
+            self._submit(xtconstant.CREDIT_FIN_BUY, "BUY", "CREDIT"), 27)
+        self.assertEqual(
+            self._submit(xtconstant.CREDIT_SLO_SELL, "SELL", "CREDIT"), 28)
+
+
 if __name__ == "__main__":
     unittest.main()

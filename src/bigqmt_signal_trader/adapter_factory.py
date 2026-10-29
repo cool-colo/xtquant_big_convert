@@ -34,11 +34,21 @@ class EmptyPositionProvider:
 
 
 class NoopPositionSyncSink:
+    """The sink non-redis transports fall back to (redis gets the real one).
+
+    Nothing in src reads ``snapshots``; it exists so the app has somewhere to
+    publish. A plain append grew without bound -- app.tick() publishes on
+    every adjust tick (~10/s), which measured as ~1MB/s of private memory on
+    a reporter's terminal until the pagefile ate the C drive (issue #441).
+    Keep only the latest snapshot, in place, so any outside reference to the
+    list stays valid.
+    """
+
     def __init__(self):
         self.snapshots = []
 
     def publish(self, snapshot):
-        self.snapshots.append(snapshot)
+        self.snapshots[:] = [snapshot]
 
 
 class NoopStateStore:

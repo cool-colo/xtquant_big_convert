@@ -33,6 +33,7 @@ Deployments that need those keep Redis or ZMQ.
 
 import ctypes
 import json
+import logging
 import os
 import queue
 import threading
@@ -40,6 +41,20 @@ import time
 
 from .base import RpcTransport, TransportError, TransportTimeout
 from ..adapters.redis_common import decode_text
+
+
+log = logging.getLogger("bigqmt")
+
+# Live server instances by pipe path (issue #436, the stop/accept race): a
+# model rerun builds a new transport while the old accept thread may never
+# have been stopped -- two accept loops then share one pipe name and a client
+# can land on the dead one. Starting a server stops any previous live server
+# for the same path first.
+# RLock：start_receiving 持锁调 previous.stop()，stop() 开头要在同一把锁下
+# 注销自己——同线程重入，非重入锁在这里直接死锁（测试即挂死）。
+_SERVERS_LOCK = threading.RLock()
+_SERVERS_BY_PATH = {}
+_STOP_JOIN_SECONDS = 5.0
 
 
 DEFAULT_PIPE_NAME = "bigqmt_rpc"
@@ -150,6 +165,10 @@ class NamedPipeTransport(RpcTransport):
         # drain 模式下由 adjust 线程轮询的已连接句柄
         self._background_threads = True
         self._drain_handles = []
+        # 每条 drain 连接一个身份 token（#436）：延迟应答按 (句柄值, token) 写回。
+        # 句柄值是裸整数，连接关闭后内核会把同一个值回收给新连接——只按值写回
+        # 会把旧应答发给复用该值的新客户端。token 是对象身份，不会被回收。
+        self._drain_tokens = {}
         self._server_lock = threading.RLock()
         # Per-thread client handle. A single shared handle would serialise every
         # caller behind one round trip -- exactly the bug #186 fixed for the ZMQ
@@ -345,8 +364,21 @@ class NamedPipeTransport(RpcTransport):
             # that is the #195 class of bug. The caller decides on those.
             self._drop_client_handle()
             self._write(self._client_handle(), payload)
-        return json.loads(decode_text(
+        response = json.loads(decode_text(
             self._read_with_watchdog(self._client_handle(), timeout_seconds)))
+        # 串线核对（#436）：服务端延迟应答按句柄值写回，连接关闭后该值可能
+        # 已被回收给新连接——旧应答可能落到本连接上。请求与响应的
+        # request_id 不一致就是拿到了别人的应答；此时本连接已被污染，丢弃
+        # 句柄并响亮报错，绝不把别人的结果当成这次调用的答案。
+        expected = request.get("request_id") if isinstance(request, dict) else None
+        answered = response.get("request_id") if isinstance(response, dict) else None
+        if (expected is not None and answered is not None
+                and answered != expected):
+            self._drop_client_handle()
+            raise TransportError(
+                "named pipe reply crossed connections: response request_id %r "
+                "does not match the request %r; handle dropped" % (answered, expected))
+        return response
 
     def _read_with_watchdog(self, handle, timeout_seconds):
         watchdog = None
@@ -401,6 +433,14 @@ class NamedPipeTransport(RpcTransport):
         super(NamedPipeTransport, self).start_receiving(on_request)
         background = kwargs.get("background_threads")
         self._background_threads = True if background is None else bool(background)
+        with _SERVERS_LOCK:
+            previous = _SERVERS_BY_PATH.get(self.path)
+            if previous is not None and previous is not self and previous._running:
+                try:
+                    previous.stop()
+                except Exception:
+                    pass
+            _SERVERS_BY_PATH[self.path] = self
         self._listener = threading.Thread(
             target=self._accept_loop, name="bigqmt-pipe-accept")
         self._listener.daemon = True
@@ -429,7 +469,11 @@ class NamedPipeTransport(RpcTransport):
                 return
             if not self._background_threads:
                 # drain 模式：不起工作线程，交给 adjust 线程轮询这个句柄。
-                self._drain_handles.append(handle)
+                # 句柄与它的身份 token 在同一把锁下登记（#436）：延迟应答要凭
+                # token 认连接，登记先于任何请求被读到。
+                with self._server_lock:
+                    self._drain_handles.append(handle)
+                    self._drain_tokens[handle] = object()
                 continue
             worker = threading.Thread(
                 target=self._serve_connection, args=(handle,),
@@ -523,7 +567,10 @@ class NamedPipeTransport(RpcTransport):
                 except Exception:
                     self._forget_drain_handle(handle)
                     break
+                with self._server_lock:
+                    token = self._drain_tokens.get(handle)
                 request["_pipe_handle"] = handle
+                request["_pipe_token"] = token
                 response = None
                 try:
                     response = self.deliver(request)
@@ -544,10 +591,14 @@ class NamedPipeTransport(RpcTransport):
         return processed
 
     def _forget_drain_handle(self, handle):
-        try:
-            self._drain_handles.remove(handle)
-        except ValueError:
-            pass
+        with self._server_lock:
+            try:
+                self._drain_handles.remove(handle)
+            except ValueError:
+                pass
+            # 先摘 token 再关句柄：关闭之后这个值随时可能被回收给新连接，
+            # 新连接会登记自己的 token——旧应答凭旧 token 找不到人，自然丢。
+            self._drain_tokens.pop(handle, None)
         self._close_server_handle(handle)
 
 
@@ -569,6 +620,22 @@ class NamedPipeTransport(RpcTransport):
             # drain 模式：没有工作线程，adjust 线程是唯一的读者也是唯一的写者，
             # 没有并发读写的问题，直接写。（漏了这一支时服务端自己发响应会抛
             # 「no pipe handle」，客户端表现为超时，实盘上就是这么卡住的。）
+            # 身份核对（#436）：延迟应答到来时，发出请求的那条连接可能早已
+            # 关闭，而句柄值已被内核回收给一条新连接——按裸整数写回会把旧
+            # 应答发给新客户端。凭登记时的 token 认连接：token 不在（或已换
+            # 成新连接的 token）就是连接已亡，应答丢弃并记日志。等待方已经
+            # 超时离开，没有可告之人；客户端侧还有 request_id 核对兜底。
+            token = (request or {}).get("_pipe_token")
+            with self._server_lock:
+                live = self._drain_tokens.get(handle)
+            if token is None or live is not token:
+                log.warning(
+                    "pipe drain reply dropped: connection closed before the "
+                    "deferred answer (handle value possibly recycled; "
+                    "request_id=%r method=%r)",
+                    (request or {}).get("request_id"),
+                    (request or {}).get("method"))
+                return
             self._write(handle, payload)
             return
         outbox.put(payload)
@@ -602,6 +669,9 @@ class NamedPipeTransport(RpcTransport):
 
     def stop(self):
         self._running = False
+        with _SERVERS_LOCK:
+            if _SERVERS_BY_PATH.get(self.path) is self:
+                del _SERVERS_BY_PATH[self.path]
         with self._server_lock:
             server = list(self._server_handles)
             clients = [entry[0] for entry in self._client_threads.values()]
@@ -609,16 +679,28 @@ class NamedPipeTransport(RpcTransport):
             # 对同一批句柄关第二次。
             self._client_threads = {}
         # Unblock the accept loop: it is parked in ConnectNamedPipe, which only
-        # returns once somebody connects. Connect to our own pipe once.
-        if server:
-            try:
-                dll = self._dll()
-                handle = dll.CreateFileW(self.path, GENERIC_READ | GENERIC_WRITE,
-                                         0, None, OPEN_EXISTING, 0, None)
-                if handle != INVALID_HANDLE_VALUE:
-                    dll.CloseHandle(handle)
-            except Exception:
-                pass
+        # returns once somebody connects. Connect to our own pipe once. Try
+        # this even when the snapshot is empty -- a raced CreateNamedPipeW can
+        # park an instance AFTER the snapshot was taken (#436).
+        try:
+            dll = self._dll()
+            handle = dll.CreateFileW(self.path, GENERIC_READ | GENERIC_WRITE,
+                                     0, None, OPEN_EXISTING, 0, None)
+            if handle != INVALID_HANDLE_VALUE:
+                dll.CloseHandle(handle)
+        except Exception:
+            pass
+        # 等 accept 线程退出再收尾（#436 的另一半）：不 join 的话，快照之后
+        # 它还可能再建一个同名实例停在那儿——模型重跑后就多出一个谁也不管
+        # 的旧实例，客户端可能连上它。
+        listener = getattr(self, "_listener", None)
+        if listener is not None and listener.is_alive() and listener is not threading.current_thread():
+            listener.join(_STOP_JOIN_SECONDS)
+        # join 之后再扫一次：竞态窗口内新建的实例这时没有生产者了，稳态。
+        with self._server_lock:
+            latecomers = list(self._server_handles)
+        for handle in latecomers:
+            self._close_server_handle(handle)
         for handle in server:
             self._close_server_handle(handle)
         dll = self._dll()

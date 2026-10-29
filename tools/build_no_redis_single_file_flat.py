@@ -594,16 +594,14 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # Same capture every mounted entry uses (#202): the strategy module owns
+    # the name list (_QMT_INJECTED_GLOBAL_FUNCS). The hand-copied tuple that
+    # used to live here had been stale since 0.2.12 -- it stopped at
+    # get_hkt_exchange_rate, so every single-file build silently shipped
+    # without the download globals (download_history_data /
+    # download_history_data2 / down_history_data), query_credit_account and
+    # the formula family.
+    qmt_extra = _strategy.capture_qmt_injected_funcs(globals())
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
         cancel_func=globals().get("cancel"),
