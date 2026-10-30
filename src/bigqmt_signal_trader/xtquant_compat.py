@@ -5840,35 +5840,61 @@ class BigQmtXtTrader:
             if last_state == "settled":
                 response = outcome.get("response") or {}
                 if not response.get("ok"):
-                    raise RpcServerRepliedError(
-                        response.get("error") or "Big QMT RPC failed: order_stock")
+                    return {
+                        "status": "SUBMITTED",
+                        "submission_state": "OUTCOME_UNKNOWN",
+                        "dispatched": None,
+                        "user_order_id": user_order_id,
+                        "order_sys_id": None,
+                        "message": response.get("error") or "Big QMT RPC failed: order_stock",
+                    }
                 server_error = str(response.get("server_error") or "")
                 if server_error:
-                    raise RpcServerRepliedError(
-                        "Big QMT order_stock server_error: %s" % server_error)
+                    return {
+                        "status": "SUBMITTED",
+                        "submission_state": "OUTCOME_UNKNOWN",
+                        "dispatched": None,
+                        "user_order_id": user_order_id,
+                        "order_sys_id": None,
+                        "message": "Big QMT order_stock server_error: %s" % server_error,
+                    }
                 return _restore_jsonable(response.get("data")) or {}
             if last_state in ("refused", "unknown"):
-                raise TimeoutError(
-                    "order_stock rpc timeout; user_order_id=%s. The bridge did NOT place "
-                    "this order (%s before dispatch): safe to retry, ideally with less "
-                    "concurrency or a longer timeout -- orders run one at a time on the "
-                    "QMT strategy thread. %s"
-                    % (user_order_id,
-                       "refused as expired" if last_state == "refused" else "never picked up",
-                       exc))
+                return {
+                    "status": "NOT_DISPATCHED",
+                    "submission_state": "NOT_DISPATCHED",
+                    "dispatched": False,
+                    "user_order_id": user_order_id,
+                    "order_sys_id": None,
+                    "message": (
+                        "The bridge did not dispatch this order (%s before dispatch): %s"
+                        % ("refused as expired" if last_state == "refused"
+                           else "never picked up", exc)),
+                }
             if time.time() >= deadline:
                 break
             time.sleep(self.ORDER_TIMEOUT_FOLLOWUP_INTERVAL_SECONDS)
         if last_state in ("dispatched", "dispatching"):
-            raise TimeoutError(
-                "order_stock rpc timeout; user_order_id=%s. passorder DID run for this "
-                "order but QMT had not assigned its id when we stopped waiting: it is "
-                "live. Find it by remark before retrying, or a retry is a duplicate. %s"
-                % (user_order_id, exc))
-        raise TimeoutError(
-            "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
-            % (user_order_id, exc)
-        )
+            return {
+                "status": "SUBMITTED",
+                "submission_state": "DISPATCHED_UNCONFIRMED",
+                "dispatched": True,
+                "user_order_id": user_order_id,
+                "order_sys_id": None,
+                "message": (
+                    "passorder was dispatched into QMT but its broker contract ID is "
+                    "pending; DO NOT RESUBMIT: %s" % exc),
+            }
+        return {
+            "status": "SUBMITTED",
+            "submission_state": "OUTCOME_UNKNOWN",
+            "dispatched": None,
+            "user_order_id": user_order_id,
+            "order_sys_id": None,
+            "message": (
+                "Order outcome query was unreachable; DO NOT RESUBMIT until reconciled: %s"
+                % exc),
+        }
 
     def _async_order_worker(self):
         """Drain queued async orders; never fires user callbacks itself.

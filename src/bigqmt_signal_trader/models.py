@@ -353,12 +353,34 @@ class OrderRequest:
         self.remark = remark
 
 
+SUBMISSION_NOT_DISPATCHED = "NOT_DISPATCHED"
+SUBMISSION_DISPATCHED_UNCONFIRMED = "DISPATCHED_UNCONFIRMED"
+SUBMISSION_LIVE_UNASSIGNED = "LIVE_UNASSIGNED"
+SUBMISSION_ACCEPTED = "ACCEPTED"
+SUBMISSION_REJECTED = "REJECTED"
+
+
 class OrderSubmitResult:
-    def __init__(self, status, user_order_id, order_sys_id=None, message=""):
+    def __init__(self, status, user_order_id, order_sys_id=None, message="",
+                 submission_state=None, dispatched=None):
         self.status = status
         self.user_order_id = user_order_id
         self.order_sys_id = order_sys_id
         self.message = message
+        if submission_state is None:
+            if str(status or "").upper() == "REJECTED":
+                submission_state = SUBMISSION_REJECTED
+            elif order_sys_id:
+                submission_state = SUBMISSION_ACCEPTED
+            else:
+                submission_state = SUBMISSION_DISPATCHED_UNCONFIRMED
+        self.submission_state = submission_state
+        if dispatched is None:
+            dispatched = submission_state not in (
+                SUBMISSION_NOT_DISPATCHED,
+                SUBMISSION_REJECTED,
+            )
+        self.dispatched = bool(dispatched)
 
 
 class OrderSnapshot:

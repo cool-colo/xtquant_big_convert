@@ -463,36 +463,38 @@ class OrderStockAfterTimeoutTest(unittest.TestCase):
     def _order(self, trader):
         return trader.order_stock("acct", "600000.SH", 23, 100, 11, 10.0, "s", "r-1")
 
+    def _order_result(self, trader):
+        return trader.order_stock_result(
+            "acct", "600000.SH", 23, 100, 11, 10.0, "s", "r-1")
+
     def test_a_refused_order_says_not_placed(self):
         trader = self._trader([{"state": "refused", "response": {"ok": False, "error": "RequestExpired"}}])
-        with self.assertRaises(TimeoutError) as ctx:
-            self._order(trader)
-        self.assertIn("did NOT place", str(ctx.exception))
-        self.assertIn("refused as expired", str(ctx.exception))
+        result = self._order_result(trader)
+        self.assertEqual(result["submission_state"], "NOT_DISPATCHED")
+        self.assertFalse(result["dispatched"])
+        self.assertIn("refused as expired", result["message"])
 
     def test_an_unseen_order_says_not_placed(self):
         trader = self._trader([{"state": "unknown", "response": None}])
-        with self.assertRaises(TimeoutError) as ctx:
-            self._order(trader)
-        self.assertIn("did NOT place", str(ctx.exception))
+        result = self._order_result(trader)
+        self.assertEqual(result["submission_state"], "NOT_DISPATCHED")
 
     def test_a_settled_order_returns_the_reply_it_missed(self):
         trader = self._trader([{"state": "settled", "response": {
             "ok": True, "server_error": "", "data": {"order_sys_id": "9", "status": "SUBMITTED"}}}])
         self.assertEqual(int(self._order(trader)), 9)
 
-    def test_a_settled_failure_raises_like_the_original_reply_would(self):
-        from bigqmt_signal_trader.xtquant_compat import RpcServerRepliedError
+    def test_a_settled_failure_is_fail_closed(self):
         trader = self._trader([{"state": "settled", "response": {
             "ok": True, "server_error": "passorder submitted but order not found in system", "data": {}}}])
-        with self.assertRaises(RpcServerRepliedError):
-            self._order(trader)
+        result = self._order_result(trader)
+        self.assertEqual(result["submission_state"], "OUTCOME_UNKNOWN")
 
     def test_a_dispatched_order_is_waited_for_then_reported_live(self):
         trader = self._trader([{"state": "dispatched", "response": {"ok": True, "data": {}}}] * 100)
-        with self.assertRaises(TimeoutError) as ctx:
-            self._order(trader)
-        self.assertIn("it is live", str(ctx.exception))
+        result = self._order_result(trader)
+        self.assertEqual(result["submission_state"], "DISPATCHED_UNCONFIRMED")
+        self.assertTrue(result["dispatched"])
         self.assertGreater(len(trader.client.calls), 2, "did not keep asking")
 
     def test_a_dispatched_order_that_settles_meanwhile_returns_its_id(self):
@@ -502,19 +504,15 @@ class OrderStockAfterTimeoutTest(unittest.TestCase):
                                               "data": {"order_sys_id": "3"}}}])
         self.assertEqual(int(self._order(trader)), 3)
 
-    def test_an_old_server_falls_back_to_the_old_message(self):
-        """No get_request_outcome there: the query fails, and the answer is
-        the honest old one -- unknown, query before retrying."""
+    def test_an_unreachable_outcome_query_fails_closed(self):
         trader = self._trader([RuntimeError("unknown method: get_request_outcome")])
-        with self.assertRaises(TimeoutError) as ctx:
-            self._order(trader)
-        self.assertIn("Query orders/trades before retrying", str(ctx.exception))
-        self.assertNotIn("did NOT place", str(ctx.exception))
+        result = self._order_result(trader)
+        self.assertEqual(result["submission_state"], "OUTCOME_UNKNOWN")
+        self.assertIsNone(result["dispatched"])
 
     def test_the_outcome_is_asked_under_the_orders_own_request_id(self):
         trader = self._trader([{"state": "unknown", "response": None}])
-        with self.assertRaises(TimeoutError):
-            self._order(trader)
+        self._order_result(trader)
         (_, order_rid), (_, asked_rid) = trader.client.calls[:2]
         self.assertTrue(order_rid)
         self.assertEqual(order_rid, asked_rid)

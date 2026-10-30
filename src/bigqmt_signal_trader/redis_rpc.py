@@ -2814,13 +2814,20 @@ class BigQmtRpcHandlers:
         # strictly before it (#299).
         submitted_at = time.time()
         result = self.order_gateway.submit(request)
+        if str(getattr(result, "status", "") or "").upper() == "REJECTED":
+            result.submission_state = "REJECTED"
+            result.dispatched = False
+            return result
+        result.dispatched = True
+        if getattr(result, "order_sys_id", None):
+            result.submission_state = "ACCEPTED"
+        else:
+            result.submission_state = "DISPATCHED_UNCONFIRMED"
 
-        # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
-        # 系统时（静默失败），记录 server_error 让客户端知道。匹配严格按
-        # user_order_id(remark) 精确比对，不做 stock_code+action 的模糊兜底。
-        # QMT 的委托号是异步分配的（passorder 无返回值），这里按唯一
-        # user_order_id(remark) 精确匹配并回填 order_sys_id，避免客户端把
-        # 「已提交但暂无委托号」误判为下单失败（issue #38）。
+        # 委托后校验：QMT 的委托号是异步分配的（passorder 无返回值）。按
+        # user_order_id(remark) 精确匹配并回填 order_sys_id，不做
+        # stock_code+action 的模糊兜底。没有查到行只表示尚未确认，不能据此
+        # 合成拒单；只有 QMT 明确的废单状态才是 REJECTED（issue #152）。
         self._last_server_error = ""
 
         # Async callers opt out of waiting for the order id. MiniQMT's
@@ -2831,17 +2838,9 @@ class BigQmtRpcHandlers:
         # post-submit "did it land?" check is skipped, and a silent rejection
         # surfaces as the absence of that push rather than as server_error.
         if not _bool_value(params.get("wait_settlement"), True):
-            # Reply now, but keep watching (#345): a refusal before any order
-            # record exists is otherwise invisible to an async caller. Kept
-            # apart from the single reply slot, so a batch (#181) can shadow
-            # every item and the reply is never held.
-            if not self.settle_orders_inline:
-                shadows = getattr(self, "_pending_shadow_settlements", None)
-                if shadows is None:
-                    shadows = self._pending_shadow_settlements = []
-                shadows.append(OrderSettlement(
-                    request, result, _monotonic() + self.order_settle_timeout_seconds,
-                    submitted_at=submitted_at, shadow=True))
+            # The execution callback channel is authoritative. Absence of an
+            # order row is not proof of refusal and must never synthesize an
+            # order_error: doing so can make a live order retry (#152).
             return result
 
         if self.settle_orders_inline:
@@ -3010,6 +3009,8 @@ class BigQmtRpcHandlers:
             if watched_sysid:
                 try:
                     settlement.result.order_sys_id = watched_sysid
+                    settlement.result.submission_state = "ACCEPTED"
+                    settlement.result.dispatched = True
                 except Exception:
                     pass
                 self._remember_settled_sysid(request.remark, watched_sysid)
@@ -3030,10 +3031,22 @@ class BigQmtRpcHandlers:
                 if not self._sysid_already_settled(
                     request.remark, str(getattr(row, "order_sys_id", "") or ""))]
             if by_remark:
-                sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
+                row = by_remark[0]
+                sysid = str(getattr(row, "order_sys_id", "") or "")
+                row_status = str(getattr(row, "status", "") or "")
+                if row_status == "57":
+                    settlement.result.order_sys_id = sysid or None
+                    settlement.result.status = "REJECTED"
+                    settlement.result.submission_state = "REJECTED"
+                    settlement.result.dispatched = True
+                    settlement.result.message = str(
+                        getattr(row, "status_msg", "") or "QMT explicitly rejected the order")
+                    return True
                 if sysid:
                     try:
                         settlement.result.order_sys_id = sysid
+                        settlement.result.submission_state = "ACCEPTED"
+                        settlement.result.dispatched = True
                     except Exception:
                         pass
                     self._remember_settled_sysid(request.remark, sysid)
@@ -3048,18 +3061,18 @@ class BigQmtRpcHandlers:
                 if not final:
                     return False
                 message = (
-                    "ORDER IS LIVE -- DO NOT RESUBMIT. passorder reached the "
-                    "broker and the order row exists (stock=%s action=%s "
+                    "ORDER IS LIVE -- DO NOT RESUBMIT. passorder was dispatched "
+                    "into QMT and the order row exists (stock=%s action=%s "
                     "price=%s volume=%d), but QMT had still not assigned "
                     "order_sys_id after %d lookup(s), so this reply carries no "
-                    "id. Find it by remark %r, or in the 委托 list; it is not a "
-                    "rejection (issue #152)."
+                    "broker contract ID. Find it by remark %r, or in the 委托 "
+                    "list; it is not a rejection (issue #152)."
                     % (request.stock_code, request.action, request.price,
                        request.volume, settlement.attempts, request.remark)
                 )
-                settlement.server_error = message
-                if inline:
-                    self._last_server_error = message
+                settlement.result.submission_state = "LIVE_UNASSIGNED"
+                settlement.result.dispatched = True
+                settlement.result.message = message
                 return True
             if not final:
                 # Not there yet. QMT assigns the id asynchronously, so an early
@@ -3082,58 +3095,24 @@ class BigQmtRpcHandlers:
                 except Exception:
                     pass
                 return True
-            # Deadline reached with no remark match. Do NOT fall back to
-            # matching stock_code+action (issue #41). But a deadline miss is
-            # NOT proof of refusal either: on a live terminal the ORDER row /
-            # order_callback can arrive seconds after ANY fixed window
-            # (measured +4.1s during market hours, issue #360 — the order was
-            # live and filled while the caller was told "not found"). So the
-            # synchronous verdict is "unconfirmed", not "failed": answer ok
-            # with no id and keep watching as a shadow settlement on an
-            # extended deadline. Only a miss at the END of that extended window
-            # is reported as a refusal. (inline mode has no drain loop to keep
-            # watching on, so it keeps the old immediate verdict.)
-            if not settlement.shadow and not inline:
-                settlement.shadow = True
-                settlement.deadline = _monotonic() + max(
-                    4.0 * float(getattr(self, "order_settle_timeout_seconds", 3.0)), 10.0)
-                try:
-                    settlement.result.message = (
-                        "submitted but UNCONFIRMED after %d lookup(s): no order "
-                        "row yet. This can be plain callback latency (observed "
-                        ">4s on a live terminal during market hours, #360) -- "
-                        "DO NOT RESUBMIT. Watch order_callback / the 委托 list "
-                        "for the id; if the extended watch also misses, an "
-                        "order_error push follows (#345)." % settlement.attempts)
-                except Exception:
-                    pass
-                return True
-            # Extended-window (or inline) miss -> now it is a refusal. The first
-            # thing to check is still the strategy's run mode (#122), but the
-            # late-callback cause is real too (#360).
-            message = (
-                "passorder submitted but order not found in system "
-                "(stock=%s action=%s price=%s volume=%d, %d lookup(s) including "
-                "an extended watch). FIRST check the strategy's run mode: in "
-                "QMT's 模型交易 list the 运行模式 column defaults to 模拟, where "
-                "passorder matches internally and never reaches the broker -- "
-                "switch it to 实盘 (a simulated account stays simulated; the "
-                "editor window and backtest/signal modes place no real order "
-                "either). Second: the terminal refused the order BEFORE "
-                "creating a record -- insufficient funds/position, price range, "
-                "permissions: it shows a dialog on the QMT screen and fires no "
-                "callback (#345). Third: the ORDER row / order_callback was "
-                "simply late -- observed >4s on a live terminal during market "
-                "hours (#360). Check the 委托 list before resubmitting."
-                % (request.stock_code, request.action, request.price,
-                   request.volume, settlement.attempts)
-            )
-            settlement.server_error = message
-            if inline:
-                self._last_server_error = message
+            # passorder already returned. A missing row after any fixed window
+            # is not proof of refusal, so preserve this as nonterminal and let
+            # execution callbacks plus normal reconciliation resolve it.
+            settlement.result.submission_state = "DISPATCHED_UNCONFIRMED"
+            settlement.result.dispatched = True
+            settlement.result.message = (
+                "passorder dispatched into QMT but no order row or broker "
+                "contract ID was visible after %d lookup(s); DO NOT RESUBMIT. "
+                "Await the execution callback or reconcile by remark %r."
+                % (settlement.attempts, request.remark))
             return True
         except Exception:
             # A failed lookup must not lose the order -- it is already submitted.
+            settlement.result.submission_state = "DISPATCHED_UNCONFIRMED"
+            settlement.result.dispatched = True
+            settlement.result.message = (
+                "passorder dispatched into QMT; settlement lookup failed. "
+                "DO NOT RESUBMIT; await callbacks or reconcile by remark.")
             return True
 
     def _handle_submit_orders_batch(self, params):
@@ -3261,16 +3240,23 @@ class BigQmtRpcHandlers:
                 continue
             try:
                 result = self._handle_submit_order(item)
+                submission_state = str(
+                    getattr(result, "submission_state", "DISPATCHED_UNCONFIRMED") or "")
+                explicit_failure = submission_state in ("NOT_DISPATCHED", "REJECTED")
                 response = {
                     "index": index,
                     "batch_id": batch_id,
-                    "success": True,
-                    "accepted": True,
-                    "confirmed": False,
+                    "success": not explicit_failure,
+                    "accepted": not explicit_failure,
+                    "confirmed": submission_state == "ACCEPTED",
                     "idempotent": False,
-                    "code": 0,
+                    "explicit_failure": explicit_failure,
+                    "code": -1 if explicit_failure else 0,
                     "order_sys_id": str(getattr(result, "order_sys_id", None) or ""),
                     "user_order_id": str(getattr(result, "user_order_id", None) or ""),
+                    "submission_state": submission_state,
+                    "dispatched": bool(getattr(result, "dispatched", False)),
+                    "message": str(getattr(result, "message", "") or ""),
                 }
                 # Not journalled when the caller opted out: those tags are not
                 # identities (async may repeat a remark for genuinely different
@@ -4323,18 +4309,11 @@ class RedisPubSubRpcService:
             except Exception:
                 pass
             settled += 1
-            if (getattr(settlement, "shadow", False)
-                    and not isinstance(settlement, CancelSettlement)):
-                # Converted at its deadline (#360): the reply answered
-                # "unconfirmed"; keep watching on the shadow queue so a late
-                # callback settles it silently and only a true refusal pushes
-                # order_error at the extended deadline.
-                self._shadow_settlements.put(settlement)
         settled += self._settle_shadow_orders(orders_cache, max_items)
         return settled
 
     def _settle_shadow_orders(self, orders_cache, max_items=100):
-        """Watch already-answered async orders; push order_error on a refusal (#345)."""
+        """Drain legacy shadow watches without synthesizing terminal errors."""
         settled = 0
         batch = min(int(max_items), self._shadow_settlements.qsize())
         for _ in range(batch):
@@ -4351,8 +4330,6 @@ class RedisPubSubRpcService:
             if not done:
                 self._shadow_settlements.put(settlement)
                 continue
-            if getattr(settlement, "server_error", ""):
-                self._push_shadow_order_error(settlement)
             settled += 1
         return settled
 

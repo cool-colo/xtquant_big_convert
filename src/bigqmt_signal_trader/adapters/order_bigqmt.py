@@ -636,6 +636,8 @@ class BigQmtOrderGateway:
             user_order_id=user_order_id,
             order_sys_id=None,
             message="passorder submitted",
+            submission_state="DISPATCHED_UNCONFIRMED",
+            dispatched=True,
         )
 
     def passorder_passthrough(

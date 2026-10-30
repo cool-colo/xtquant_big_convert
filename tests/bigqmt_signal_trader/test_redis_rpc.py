@@ -523,9 +523,7 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         self.assertEqual(service.pending_settlement_count(), 0)
 
     def test_order_that_never_lands_reports_after_the_deadline(self):
-        """#360: the first deadline miss answers "unconfirmed" (no
-        server_error) and keeps watching on the shadow queue; the refusal
-        text only surfaces when the extended watch also expires."""
+        """A deadline miss remains nonterminal and never creates an error event."""
         gateway = LateLandingOrderGateway(never=True)
         redis_client, service = self._service(gateway, timeout=0.0)
         self._submit(service)
@@ -534,14 +532,9 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:ord-1"])
         self.assertTrue(response["ok"])
         self.assertFalse(response["server_error"])
-        self.assertIn("UNCONFIRMED", response["data"]["message"])
-        self.assertEqual(service.shadow_settlement_count(), 1)
-
-        shadow = service._shadow_settlements.get_nowait()
-        shadow.deadline = 0.0
-        service._shadow_settlements.put(shadow)
-        service.drain_pending()
-        self.assertIn("not found in system", shadow.server_error)
+        self.assertEqual(response["data"]["submission_state"], "DISPATCHED_UNCONFIRMED")
+        self.assertIn("DO NOT RESUBMIT", response["data"]["message"])
+        self.assertEqual(service.shadow_settlement_count(), 0)
 
     def test_native_lookup_error_keeps_submission_without_resubmitting(self):
         submissions = []
@@ -566,7 +559,8 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         self.assertTrue(response["ok"], response["error"])
         self.assertEqual(response["data"]["status"], "SUBMITTED")
         self.assertIsNone(response["data"]["order_sys_id"])
-        self.assertEqual(response["data"]["message"], "passorder submitted")
+        self.assertIn("settlement lookup failed", response["data"]["message"])
+        self.assertEqual(response["data"]["submission_state"], "DISPATCHED_UNCONFIRMED")
         self.assertEqual(response["server_error"], "")
         self.assertEqual(service.pending_settlement_count(), 0)
 
@@ -575,27 +569,20 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         self.assertEqual(len(submissions), 1)
         self.assertEqual(queries, [("acct", "STOCK", "ORDER", "")])
 
-    def test_settlement_error_does_not_leak_into_other_responses(self):
-        """issue #43 again, by another route: settling happens long after the
-        order left the handler, so its diagnostic must ride on the settlement
-        rather than handlers._last_server_error."""
+    def test_unconfirmed_state_does_not_leak_into_other_responses(self):
         gateway = LateLandingOrderGateway(never=True)
         redis_client, service = self._service(gateway, timeout=0.0)
         self._submit(service)
         service.drain_pending()
-        # #360: the first deadline miss is "unconfirmed"; the refusal lands on
-        # the settlement (shadow queue), not on this or any later response.
-        self.assertFalse(
-            json.loads(redis_client.kv["bigqmt:rpc:resp:acct:ord-1"])["server_error"])
-        shadow = service._shadow_settlements.get_nowait()
-        shadow.deadline = 0.0
-        service._shadow_settlements.put(shadow)
+        order_response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:ord-1"])
+        self.assertFalse(order_response["server_error"])
+        self.assertEqual(
+            order_response["data"]["submission_state"], "DISPATCHED_UNCONFIRMED")
 
         service.enqueue_payload({"request_id": "later-ping", "account_id": "acct",
                                  "method": "ping", "params": {}})
         service.drain_pending()
 
-        self.assertIn("not found in system", shadow.server_error)
         self.assertEqual(
             json.loads(redis_client.kv["bigqmt:rpc:resp:acct:later-ping"])["server_error"], "")
 
@@ -732,8 +719,7 @@ class RedisRpcTest(unittest.TestCase):
         self.assertEqual(result.order_sys_id, "sysid-1")
         self.assertEqual(handlers._last_server_error, "")
 
-    def test_submit_order_silent_rejection_sets_server_error(self):
-        # 委托没进系统（静默拒绝）时记录 server_error，客户端据此收到真实原因。
+    def test_submit_order_without_row_stays_unconfirmed(self):
         gateway = LandingOrderGateway(landed=False)
         handlers = BigQmtRpcHandlers(
             account_id="acct", market_data=FakeMarketData(),
@@ -750,7 +736,9 @@ class RedisRpcTest(unittest.TestCase):
             "order_remark": "REMARK-38",
         })
         self.assertIsNone(result.order_sys_id)
-        self.assertIn("not found in system", handlers._last_server_error)
+        self.assertEqual(result.submission_state, "DISPATCHED_UNCONFIRMED")
+        self.assertTrue(result.dispatched)
+        self.assertEqual(handlers._last_server_error, "")
 
     def test_server_error_does_not_leak_into_later_requests(self):
         """issue #43: _last_server_error is instance state read by every response,
@@ -770,7 +758,7 @@ class RedisRpcTest(unittest.TestCase):
             "order_volume": 100, "price_type": 11, "price": 10.0,
             "order_remark": "REMARK-43",
         })
-        self.assertIn("not found in system", handlers._last_server_error)
+        self.assertEqual(handlers._last_server_error, "")
 
         # Any later request must start from a clean slot.
         handlers.handle("ping", {})
@@ -795,7 +783,7 @@ class RedisRpcTest(unittest.TestCase):
             "order_volume": 100, "price_type": 11, "price": 10.0,
             "order_remark": "REMARK-43b",
         })
-        self.assertNotEqual(handlers._last_server_error, "")
+        self.assertEqual(handlers._last_server_error, "")
         with self.assertRaises(ValueError):
             handlers.handle("no_such_method", {})
         self.assertEqual(handlers._last_server_error, "")
@@ -832,7 +820,8 @@ class RedisRpcTest(unittest.TestCase):
         })
 
         self.assertIsNone(result.order_sys_id)
-        self.assertIn("not found in system", handlers._last_server_error)
+        self.assertEqual(result.submission_state, "DISPATCHED_UNCONFIRMED")
+        self.assertEqual(handlers._last_server_error, "")
 
     def test_remark_match_still_backfills_sysid_with_other_orders_present(self):
         """The strict match must not regress the issue #38 backfill."""

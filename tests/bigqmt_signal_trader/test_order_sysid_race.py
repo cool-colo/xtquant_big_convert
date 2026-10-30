@@ -173,49 +173,37 @@ class DeadlineTest(_Service):
     def test_it_reports_the_order_as_live_not_rejected(self):
         response = self._timed_out()
 
-        error = response.get("server_error") or ""
-        self.assertIn("ORDER IS LIVE", error)
-        self.assertIn("DO NOT RESUBMIT", error)
+        self.assertFalse(response.get("server_error"))
+        self.assertEqual(response["data"]["submission_state"], "LIVE_UNASSIGNED")
+        self.assertTrue(response["data"]["dispatched"])
+        self.assertIn("DO NOT RESUBMIT", response["data"]["message"])
 
     def test_it_names_the_remark_so_the_order_can_be_found(self):
         response = self._timed_out()
 
-        self.assertIn("ord-1", response.get("server_error") or "")
+        self.assertIn("ord-1", response["data"]["message"])
 
     def test_it_does_not_reuse_the_not_in_system_wording(self):
         """That message means the opposite -- the order never reached the
         broker -- and leads with QMT's 模拟 run mode (issue #122). Saying it
         here would send the reporter looking in exactly the wrong place."""
-        error = self._timed_out().get("server_error") or ""
+        error = self._timed_out()["data"]["message"]
 
         self.assertNotIn("not found in system", error)
         self.assertNotIn("运行模式", error)
 
-    def test_the_client_turns_that_into_an_exception_not_a_minus_one(self):
-        """xtquant_compat raises on server_error, which is the whole reason
-        the deadline path sets one. RpcServerRepliedError is a RuntimeError
-        subclass, so callers catching RuntimeError see no change; the distinct
-        type is what lets the batch path tell a refused batch (nothing ran)
-        from a timed-out one (may be running)."""
-        import inspect
+    def test_the_reply_is_structured_nonterminal_state(self):
+        response = self._timed_out()["data"]
 
-        from bigqmt_signal_trader import xtquant_compat
-
-        source = inspect.getsource(xtquant_compat)
-        self.assertIn('raise RpcServerRepliedError(', source)
-        self.assertIn('"Big QMT %s server_error: %s"', source)
-        self.assertTrue(issubclass(xtquant_compat.RpcServerRepliedError, RuntimeError))
+        self.assertNotEqual(response["status"], "REJECTED")
+        self.assertEqual(response["submission_state"], "LIVE_UNASSIGNED")
+        self.assertIsNone(response["order_sys_id"])
 
 
-class MissingOrderIsStillMissingTest(_Service):
-    """The neighbouring branch must keep its own meaning (#41, #122).
+class MissingOrderRemainsUnconfirmedTest(_Service):
+    """No row after a fixed window is not proof that passorder was refused."""
 
-    Since #360 the first deadline miss is "unconfirmed" (reply carries no
-    server_error and the watch moves to the shadow queue); the refusal text
-    arrives only when the extended watch also expires with no row.
-    """
-
-    def test_no_remark_match_at_the_deadline_still_says_not_in_system(self):
+    def test_no_remark_match_at_the_deadline_is_nonterminal(self):
         class NeverLands(DryRunOrderGateway):
             def query_orders(self, account_id, strategy_name):
                 return []
@@ -226,19 +214,29 @@ class MissingOrderIsStillMissingTest(_Service):
 
         response = self._response(redis_client)
         self.assertFalse(response.get("server_error"))
-        self.assertIn("UNCONFIRMED", response["data"]["message"])
-        self.assertEqual(service.shadow_settlement_count(), 1)
+        self.assertEqual(response["data"]["submission_state"], "DISPATCHED_UNCONFIRMED")
+        self.assertIn("DO NOT RESUBMIT", response["data"]["message"])
+        self.assertEqual(service.shadow_settlement_count(), 0)
 
-        # Extended window expires -> the refusal text, unchanged. No event
-        # sink is wired here, so assert on the settlement itself.
-        shadow = service._shadow_settlements.get_nowait()
-        shadow.deadline = 0.0
-        service._shadow_settlements.put(shadow)
+    def test_status_57_is_an_explicit_rejection(self):
+        gateway = IdArrivesLateGateway(sysid_after=1)
+        original = gateway.query_orders
+
+        def rejected(account_id, strategy_name):
+            rows = original(account_id, strategy_name)
+            rows[0].status = "57"
+            rows[0].status_msg = "counter refused"
+            return rows
+
+        gateway.query_orders = rejected
+        redis_client, service = self._service(gateway, timeout=0.0)
+        self._submit(service)
         service.drain_pending()
 
-        self.assertIn("not found in system", shadow.server_error)
-        self.assertIn("运行模式", shadow.server_error)
-        self.assertEqual(service.shadow_settlement_count(), 0)
+        data = self._response(redis_client)["data"]
+        self.assertEqual(data["submission_state"], "REJECTED")
+        self.assertEqual(data["status"], "REJECTED")
+        self.assertIn("counter refused", data["message"])
 
 
 if __name__ == "__main__":
