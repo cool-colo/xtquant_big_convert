@@ -123,24 +123,38 @@ class PipeQuotePushChannel(object):
                 self._sub_handles[handle] = threading.Lock()
 
     def publish(self, topic, data):
+        topic = str(topic)
+        require_delivery = topic.startswith("exec:")
         if not self._running:
-            return
+            if require_delivery:
+                raise RuntimeError("execution-event pipe publisher is not running")
+            return 0
         payload = json.dumps(
-            {"topic": str(topic), "data": data},
+            {"topic": topic, "data": data},
             ensure_ascii=False, default=str).encode("utf-8")
-        dll, wintypes = self._dll()
         with self._sub_handles_lock:
             items = list(self._sub_handles.items())
+        if not items:
+            if require_delivery:
+                raise RuntimeError("execution-event pipe has no connected readers")
+            return 0
+        dll, wintypes = self._dll()
         dead = []
+        delivered = 0
         for handle, lock in items:
             written = wintypes.DWORD()
             with lock:
                 ok = dll.WriteFile(handle, payload, len(payload),
                                    ctypes.byref(written), None)
-            if not ok:
+            if ok and written.value == len(payload):
+                delivered += 1
+            else:
                 dead.append(handle)
         for handle in dead:
             self._drop_handle(handle)
+        if require_delivery and not delivered:
+            raise RuntimeError("execution-event pipe write failed for every reader")
+        return delivered
 
     def _drop_handle(self, handle):
         dll, _ = self._dll()

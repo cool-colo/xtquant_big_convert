@@ -14,6 +14,7 @@ account the bridge serves, one publish per account (redis) or one extra
 PUB bind per account (zmq). The client role is untouched.
 """
 
+import json
 import os
 import sys
 import types
@@ -76,6 +77,36 @@ class RedisChannelFansOutTest(unittest.TestCase):
                           "bigqmt:quote_push:second:600000.SH"], channels)
         for _, raw in redis.published:
             self.assertEqual({"lastPrice": 1.0}, decode_push_payload(raw)["data"])
+
+    def test_json_wire_encoding_does_not_require_msgpack_on_the_receiver(self):
+        redis = _Redis()
+        channel = RedisQuotePushChannel(
+            redis,
+            account_id="primary",
+            wire_encoding="json",
+        )
+
+        channel.publish("SH", {"600000.SH": {"lastPrice": 10.0}})
+
+        raw = redis.published[0][1]
+        decoded = json.loads(raw.decode("utf-8"))
+        self.assertEqual(decoded["combo_key"], "SH")
+        self.assertEqual(decoded["data"]["600000.SH"]["lastPrice"], 10.0)
+
+    def test_relay_can_request_publish_errors_for_worker_retry_accounting(self):
+        class BrokenRedis(object):
+            def publish(self, channel, value):
+                raise RuntimeError("redis unavailable")
+
+        channel = RedisQuotePushChannel(
+            BrokenRedis(),
+            account_id="primary",
+            wire_encoding="json",
+            raise_publish_errors=True,
+        )
+
+        with self.assertRaises(RuntimeError):
+            channel.publish("SH", {"v": 1})
 
     def test_the_secondarys_channel_is_the_one_its_client_subscribes(self):
         """The client side derives the channel from its own account; the

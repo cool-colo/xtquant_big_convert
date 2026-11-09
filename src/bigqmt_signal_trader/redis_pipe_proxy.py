@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import math
 import os
+import queue
 import signal
 import socket
 import threading
@@ -24,6 +25,12 @@ from .transports.redis_transport import RedisTransport, _loads
 SUBMIT_METHODS = frozenset(("submit_order", "submit_orders_batch", "passorder"))
 CANCEL_METHODS = frozenset(("cancel_order", "cancel_orders_batch"))
 EVENT_TYPES = frozenset(("order", "trade", "order_error", "cancel_error"))
+EXEC_TOPIC_TYPES = {
+    "exec:order": "order",
+    "exec:trade": "trade",
+    "exec:order_error": "order_error",
+    "exec:cancel_error": "cancel_error",
+}
 
 _LOCK_RENEW_SCRIPT = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -97,7 +104,7 @@ class RedisPipeProxy(object):
                  lock_ttl_seconds=15, lock_renew_seconds=5,
                  quote_push_relay=False, rpc_pipe=None, event_pipe=None,
                  redis_transport=None, quote_pipe=None, quote_redis_channel=None,
-                 log=None):
+                 log=None, quote_queue_capacity=4096):
         self.redis = redis_client
         self.account_id = str(account_id or "")
         if not self.account_id:
@@ -111,6 +118,7 @@ class RedisPipeProxy(object):
         self.event_dedup_ttl_seconds = max(1, int(event_dedup_ttl_seconds))
         self.lock_ttl_seconds = max(3, int(lock_ttl_seconds))
         self.lock_renew_seconds = max(0.2, float(lock_renew_seconds))
+        self.quote_queue_capacity = max(1, int(quote_queue_capacity))
         self.quote_push_relay = bool(quote_push_relay)
         self._log = log or (lambda message: print("[bigqmt_proxy] %s" % message))
         self._rpc_pipe = rpc_pipe or NamedPipeTransport(
@@ -142,8 +150,20 @@ class RedisPipeProxy(object):
                     redis_client,
                     account_id=self.account_id,
                     print_prefix="[bigqmt_proxy_quote_redis]",
+                    wire_encoding="json",
+                    raise_publish_errors=True,
                 )
             )
+        self._quote_topics = queue.Queue(maxsize=self.quote_queue_capacity)
+        self._quote_pending = {}
+        self._quote_pending_lock = threading.Lock()
+        self._quote_exec_events = queue.Queue()
+        self._quote_relay_stop = threading.Event()
+        self._quote_publish_thread = None
+        self._quote_exec_thread = None
+        self._quote_dropped = 0
+        self._quote_publish_failures = 0
+        self._quote_exec_failures = 0
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.workers, thread_name_prefix="bigqmt-proxy"
         )
@@ -229,11 +249,7 @@ class RedisPipeProxy(object):
             self._running = True
             self._event_pipe.start_receiving(self._handle_event, background_threads=True)
             if self.quote_push_relay:
-                self._quote_redis_channel.start_publisher()
-                # An empty topic list accepts every pipe topic. Quote frames are
-                # selected in _handle_quote_push; exec:* continues over the
-                # acknowledged execution-event pipe.
-                self._quote_pipe.start_subscriber([], self._handle_quote_push)
+                self._start_quote_relay()
             with self._state_lock:
                 self._accepting = True
             self._redis_transport.start_receiving(self._ingress, background_threads=True)
@@ -454,25 +470,154 @@ class RedisPipeProxy(object):
             self.event_dedup_ttl_seconds,
         )
 
+    def _start_quote_relay(self):
+        """Start Redis workers before accepting frames from the QMT pipe."""
+        self._quote_relay_stop.clear()
+        self._quote_redis_channel.start_publisher()
+        self._quote_publish_thread = threading.Thread(
+            target=self._quote_publish_loop,
+            name="bigqmt-proxy-quote-redis",
+            daemon=True,
+        )
+        self._quote_exec_thread = threading.Thread(
+            target=self._quote_exec_loop,
+            name="bigqmt-proxy-exec-fallback",
+            daemon=True,
+        )
+        self._quote_publish_thread.start()
+        self._quote_exec_thread.start()
+        # An empty topic list accepts quote combinations and exec:* fallback
+        # frames. The callback only enqueues; Redis I/O never blocks pipe reads.
+        self._quote_pipe.start_subscriber([], self._handle_quote_push)
+
     def _handle_quote_push(self, topic, data):
-        """Relay one QMT pipe quote frame onto the existing Redis quote channel."""
+        """Queue one QMT events-pipe frame without performing Redis I/O."""
         topic = str(topic or "")
-        if not topic or topic.startswith("exec:"):
+        if not topic:
             return
         if not isinstance(data, dict):
             self._log_error("discarded invalid quote push topic=%s" % topic)
             return
-        try:
-            self._quote_redis_channel.publish(topic, data)
-        except Exception as exc:
-            self._log_error("quote Redis publish failed topic=%s: %s" % (topic, exc))
+        if topic.startswith("exec:"):
+            self._enqueue_exec_fallback(topic, data)
+            return
+        self._enqueue_latest_quote(topic, data)
 
-    def _stop_quote_relay(self):
-        for channel in (self._quote_pipe, self._quote_redis_channel):
-            if channel is None:
+    def _enqueue_latest_quote(self, topic, data):
+        """Keep at most one queued frame per topic, replacing it with latest."""
+        with self._quote_pending_lock:
+            if topic in self._quote_pending:
+                self._quote_pending[topic] = data
+                return
+            try:
+                self._quote_topics.put_nowait(topic)
+            except queue.Full:
+                try:
+                    oldest = self._quote_topics.get_nowait()
+                except queue.Empty:
+                    oldest = None
+                if oldest is not None:
+                    self._quote_pending.pop(oldest, None)
+                self._quote_dropped += 1
+                if self._quote_dropped <= 3 or self._quote_dropped % 1000 == 0:
+                    self._log_error(
+                        "quote relay overloaded; dropped oldest topic "
+                        "dropped=%d capacity=%d"
+                        % (self._quote_dropped, self.quote_queue_capacity)
+                    )
+                try:
+                    self._quote_topics.put_nowait(topic)
+                except queue.Full:
+                    return
+            self._quote_pending[topic] = data
+
+    def _enqueue_exec_fallback(self, topic, data):
+        event_type = EXEC_TOPIC_TYPES.get(topic)
+        if event_type is None:
+            self._log_error("discarded unknown execution fallback topic=%s" % topic)
+            return
+        event = dict(data)
+        inner_account = str(event.get("account_id") or self.account_id)
+        if inner_account != self.account_id:
+            self._log_error("discarded cross-account execution fallback topic=%s" % topic)
+            return
+        event["account_id"] = self.account_id
+        event["event_type"] = event_type
+        if not str(event.get("event_id") or ""):
+            # Compatibility with an older QMT flat file. New files mint this
+            # before the primary/fallback split, which is what makes dedup exact.
+            event["event_id"] = "quote-fallback:%s" % uuid.uuid4().hex
+            self._log_error("execution fallback arrived without event_id topic=%s" % topic)
+        payload = json.dumps(event, ensure_ascii=False, default=str)
+        if len(payload.encode("utf-8")) > self.event_max_bytes:
+            self._log_error("discarded oversized execution fallback topic=%s" % topic)
+            return
+        # Deliberately unbounded: these are rare emergency frames and unlike
+        # quotes they must never be discarded by the quote overload policy.
+        self._quote_exec_events.put_nowait(event)
+
+    def _quote_publish_loop(self):
+        while not self._quote_relay_stop.is_set():
+            try:
+                topic = self._quote_topics.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            with self._quote_pending_lock:
+                data = self._quote_pending.pop(topic, None)
+            if data is None:
                 continue
             try:
-                channel.stop()
+                self._quote_redis_channel.publish(topic, data)
+            except Exception as exc:
+                self._quote_publish_failures += 1
+                if self._quote_publish_failures <= 3 or self._quote_publish_failures % 100 == 0:
+                    self._log_error(
+                        "quote Redis publish failed x%d topic=%s: %s"
+                        % (self._quote_publish_failures, topic, exc)
+                    )
+
+    def _quote_exec_loop(self):
+        current = None
+        while not self._quote_relay_stop.is_set():
+            if current is None:
+                try:
+                    current = self._quote_exec_events.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+            try:
+                payload = json.dumps(current, ensure_ascii=False, default=str)
+                self._publish_event_atomic(current["event_id"], current["event_type"], payload)
+                current = None
+            except Exception as exc:
+                self._quote_exec_failures += 1
+                if self._quote_exec_failures <= 3 or self._quote_exec_failures % 100 == 0:
+                    self._log_error(
+                        "execution fallback Redis publish failed x%d id=%s: %s"
+                        % (self._quote_exec_failures, current.get("event_id"), exc)
+                    )
+                self._quote_relay_stop.wait(0.25)
+
+    def _stop_quote_relay(self):
+        # Stop intake first. Give healthy Redis a short chance to flush rare
+        # execution fallback frames, then stop workers without waiting through
+        # an unbounded Redis outage.
+        if self._quote_pipe is not None:
+            try:
+                self._quote_pipe.stop()
+            except Exception:
+                pass
+        deadline = time.time() + min(self.shutdown_grace_seconds, 2.0)
+        while not self._quote_exec_events.empty() and time.time() < deadline:
+            time.sleep(0.02)
+        self._quote_relay_stop.set()
+        for thread in (self._quote_publish_thread, self._quote_exec_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(2.0)
+        self._quote_publish_thread = None
+        self._quote_exec_thread = None
+        if self._quote_redis_channel is not None:
+            try:
+                self._quote_redis_channel.stop()
             except Exception:
                 pass
 
@@ -525,6 +670,12 @@ def _parser():
         action="store_true",
         help="Relay the QMT quote-events pipe to BigQMT Redis quote Pub/Sub.",
     )
+    parser.add_argument(
+        "--quote-queue-capacity",
+        type=int,
+        default=4096,
+        help="Maximum distinct pending quote topics; newest data replaces older data.",
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-pending", type=int, default=64)
     parser.add_argument("--pipe-connect-timeout", type=float, default=0.25)
@@ -558,6 +709,7 @@ def main(argv=None):
         pipe_name=args.pipe_name,
         event_pipe_name=args.event_pipe_name,
         quote_push_relay=args.quote_push_relay,
+        quote_queue_capacity=args.quote_queue_capacity,
         workers=args.workers,
         max_pending=args.max_pending,
         pipe_connect_timeout_seconds=args.pipe_connect_timeout,

@@ -15,6 +15,7 @@ class FakeSession:
     def __init__(self):
         self.subscribed = []
         self.unsubscribed = []
+        self.replayed = 0
         self.started = False
         self._next = 0
         self._active = set()
@@ -32,6 +33,9 @@ class FakeSession:
 
     def has_subscription(self, sub_id):
         return sub_id in self._active
+
+    def replay_subscriptions(self):
+        self.replayed += 1
 
     def start(self):
         self.started = True
@@ -95,6 +99,25 @@ class XtDataWholeQuoteDelegationTest(unittest.TestCase):
         data.subscribe_whole_quote(["SH"], callback=lambda d: None)
         data.subscribe_whole_quote(["SZ"], callback=lambda d: None)
         self.assertEqual(len(session.subscribed), 2)
+
+    def test_replay_uses_existing_session_without_snapshot_prime(self):
+        session = FakeSession()
+        data, client = self._xtdata(session)
+        received = []
+        data.subscribe_whole_quote(["SH"], callback=received.append)
+        calls_before = list(client.calls)
+        received_before = list(received)
+
+        self.assertEqual(data.replay_whole_quote_subscriptions(), 1)
+
+        self.assertEqual(session.replayed, 1)
+        self.assertEqual(client.calls, calls_before)
+        self.assertEqual(received, received_before)
+
+    def test_replay_without_an_active_session_is_a_noop(self):
+        data, _client = self._xtdata(FakeSession())
+
+        self.assertEqual(data.replay_whole_quote_subscriptions(), 0)
 
 
 if __name__ == "__main__":

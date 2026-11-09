@@ -134,6 +134,35 @@ class FallbackTest(_StrategyState):
         self.assertTrue(ok)
         self.assertEqual(len(channel.published), 1)
 
+    def test_primary_and_fallback_attempts_share_one_event_id(self):
+        class RecordingFailingEvents(FakeExecEvents):
+            def __init__(self):
+                self.attempts = []
+
+            def publish_exec_event(self, sink, account_id, event):
+                self.attempts.append(dict(event))
+                if sink.fail:
+                    raise RuntimeError("primary failed after accepting event")
+                sink.published.append((account_id, event))
+
+        events = RecordingFailingEvents()
+        primary, fallback = Sink("primary", fail=True), Sink("fallback")
+        self._with_channel(fallback)
+
+        ok = strategy._publish_one(
+            events,
+            primary,
+            "acct",
+            {"event_type": "trade", "trade_id": "T1"},
+            "trade",
+            {},
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(len(events.attempts), 2)
+        self.assertTrue(events.attempts[0]["event_id"])
+        self.assertEqual(events.attempts[0]["event_id"], events.attempts[1]["event_id"])
+
     def test_no_channel_to_fall_back_to_reports_failure(self):
         redis = Sink("redis", fail=True)
         self._with_channel(None)

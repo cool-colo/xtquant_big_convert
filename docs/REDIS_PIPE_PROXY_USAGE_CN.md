@@ -31,7 +31,9 @@ Redis <- Windows 独立代理进程
 
 开启 `--quote-push-relay` 后，代理把 QMT 行情 events pipe 转发到现有 Redis
 行情 Pub/Sub。订单、成交和错误事件仍由带确认的独立执行事件管道转发；
-Nautilus 的 1 秒执行轮询仅用于对账和补漏，不是主事件通道。
+当该管道启动失败或队列已满时，`exec:*` 应急帧通过行情 events pipe 转入相同
+Redis 执行事件频道，并复用 `event_id` 去重。Nautilus 的 1 秒执行轮询仅用于
+对账和补漏，不是主事件通道。
 
 ## 2. 前置条件
 
@@ -138,6 +140,7 @@ bigqmt-redis-pipe-proxy `
   --pipe-name bigqmt_rpc `
   --event-pipe-name bigqmt_exec `
   --quote-push-relay `
+  --quote-queue-capacity 4096 `
   --workers 8 `
   --max-pending 64
 ```
@@ -176,6 +179,7 @@ ACL 用户名，再加 `--redis-username`。
 | `--legacy-read-timeout` | 30 秒 | 无有效超时的旧读取和撤单请求上限 |
 | `--event-max-bytes` | 1 MiB | 单个执行事件最大尺寸 |
 | `--quote-push-relay` | 关闭 | 把行情 events pipe 转发到 Redis Pub/Sub |
+| `--quote-queue-capacity` | 4096 | 待发布行情 topic 上限；同 topic 只保留最新帧 |
 | `--event-dedup-ttl` | 86400 秒 | 事件 ID 去重窗口 |
 | `--shutdown-grace` | 10 秒 | 停机时等待已接收任务的时间 |
 
@@ -303,7 +307,8 @@ Redis—代理—管道链路。
 | `PIPE_TIMEOUT`（读取） | QMT 未及时响应 | 检查 QMT adjust 调度和查询耗时 |
 | 下单方仅看到 Redis 超时 | 管道写入后结果不确定 | 立即调用 `get_request_outcome`，禁止盲目重下 |
 | 有对账轮询但无实时回调 | 事件管道未启用或名称不一致 | 检查 `exec_events_transport/pipe_name` 和代理日志 |
-| `event queue full` | 代理/Redis 长时间不可用或事件峰值过大 | 停止实盘、恢复链路并完成账户对账 |
+| `event queue full` | 独立执行管道队列已满；事件将尝试走 `exec:*` 应急通道 | 立即恢复主事件链路并完成账户对账 |
+| `quote relay overloaded` | Redis 跟不上行情，代理开始丢弃最旧 topic | 检查 Redis；客户端会进入静默快照兜底 |
 | `Redis Streams unavailable` | Redis 服务端低于 5.0 | 事件仍走 Pub/Sub，但没有事件流留存 |
 | `another proxy owns account` | 同账号已有代理或旧锁尚未过期 | 查明原进程；不要同时启动两个代理 |
 
@@ -311,7 +316,7 @@ Redis—代理—管道链路。
 
 - 一个代理进程只服务一个账号；
 - 当前多账号 QMT 管道服务不受支持；
-- 行情全推未通过管道转发，必须轮询；
+- 行情全推需要显式启动 `--quote-push-relay`；关闭时仍必须轮询；
 - 当前验证范围是现金 A 股 `STOCK` 账号；
 - QMT 端下载任务、Redis 快照、身份持久化等功能保持关闭；
 - Nautilus 配置目前没有 Redis username/TLS 字段；需要命名 ACL 用户或直连

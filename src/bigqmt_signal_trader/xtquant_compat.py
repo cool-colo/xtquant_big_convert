@@ -3549,6 +3549,19 @@ class BigQmtXtData:
                 pass
         return sub_id
 
+    def replay_whole_quote_subscriptions(self):
+        """Replay active whole-quote handles without creating new local handles.
+
+        Unlike ``subscribe_whole_quote``, this does not prime callbacks with a
+        snapshot.  Callers can therefore use it for stale-push recovery without
+        mistaking a pull snapshot for evidence that push delivery recovered.
+        """
+        session = self._quote_session
+        if session is None:
+            return 0
+        session.replay_subscriptions()
+        return 1
+
     # Exchange tokens QMT actually answers a whole-market snapshot for.
     # Measured on the live terminal: SH 卡 SZ together return 5218 rows in
     # ~330ms, BJ returns 343. Every futures token -- SF DF ZF IF INE GF --

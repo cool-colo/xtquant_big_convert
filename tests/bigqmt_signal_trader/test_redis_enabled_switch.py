@@ -309,10 +309,11 @@ class PipeBuildTest(unittest.TestCase):
     def test_the_builder_forces_pipe(self):
         self.assertIn('"transport"] = "pipe"', self._read(self.BUILDER))
 
-    def test_the_builder_disables_redis_and_quote_push(self):
+    def test_the_builder_disables_redis_and_enables_pipe_push(self):
         text = self._read(self.BUILDER)
         self.assertIn('"redis_enabled"] = False', text)
-        self.assertIn('"quote_push"] = {"enabled": False}', text)
+        self.assertIn('_quote_push["enabled"] = True', text)
+        self.assertIn('"exec_events_transport"] = "pipe"', text)
 
     def test_the_builder_does_not_substitute_zmq(self):
         """pipe_transport 在包里、零依赖——pipe 版不做 no-redis 的

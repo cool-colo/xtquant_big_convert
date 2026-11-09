@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback as _traceback
+import uuid as _uuid
 
 # The DRYRUN entry reloads strategy/runtime/redis_rpc/redis_common but NOT the
 # other package submodules. Without this, the "from adapter_factory import build_app"
@@ -1862,6 +1863,12 @@ def _publish_one(exec_events, sink, account_id, event, kind, config):
     client never learns the order happened. Trying the other channel costs one
     extra attempt and only on the failure path.
     """
+    # One callback may first hit the acknowledged execution pipe and then fall
+    # back to the quote-events pipe. Mint the id before either attempt so the
+    # proxy can deduplicate a late primary delivery against its fallback twin.
+    if isinstance(event, dict):
+        event = dict(event)
+        event.setdefault("event_id", _uuid.uuid4().hex)
     try:
         exec_events.publish_exec_event(sink, account_id, event)
         _exec_sink_state["redis_failures"] = 0

@@ -725,8 +725,14 @@ appears functional.
 
 Whole-quote data uses a dedicated one-way named pipe derived from the RPC pipe
 name (`bigqmt_rpc_events_<account>`). The external proxy subscribes to that pipe
-and republishes non-`exec:*` topics onto the existing account-scoped Redis quote
-channels. Execution events remain on their acknowledged event pipe. The relay
+and republishes quote topics onto the existing account-scoped Redis quote
+channels using JSON, independent of optional msgpack installation. Pipe reads
+only update a bounded, per-topic latest-value queue; a dedicated worker performs
+potentially blocking Redis I/O, so a Redis outage cannot back-pressure QMT's
+synchronous `WriteFile` callback. Execution events normally remain on their
+acknowledged event pipe. If that sink cannot accept a callback, `exec:*` frames
+use a separate FIFO retry worker and the same stable `event_id`/Redis dedup path;
+they are never subject to quote overload dropping. The relay
 remains opt-in for ordinary QMT package deployments and for the proxy. The
 generated `BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py` deployment artifact is the
 explicit push variant and therefore embeds `quote_push.enabled=True`.

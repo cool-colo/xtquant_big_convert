@@ -94,13 +94,13 @@ class PipePushChannelTest(unittest.TestCase):
         self.assertEqual(got_a, [{"n": 1}])
         self.assertEqual(got_b, [{"n": 1}])
 
-    def test_publish_with_no_subscribers_is_a_noop(self):
+    def test_exec_publish_with_no_subscribers_reports_delivery_failure(self):
         path = _paths()
         server = PipeQuotePushChannel(bind_address=path)
         server.start_publisher()
         try:
-            # No subscriber at all: pub/sub semantics -- dropped, no error.
-            server.publish("exec:order", {"order_sys_id": "S1"})
+            with self.assertRaisesRegex(RuntimeError, "no connected readers"):
+                server.publish("exec:order", {"order_sys_id": "S1"})
         finally:
             server.stop()
 

@@ -29,8 +29,18 @@ except Exception:  # pragma: no cover - depends on optional dependency
     _HAS_MSGPACK = False
 
 
-def encode_push_payload(payload):
-    """Encode a push payload dict to bytes (msgpack preferred, json fallback)."""
+def encode_push_payload(payload, encoding=None):
+    """Encode a push payload dict.
+
+    ``encoding="json"`` is used by cross-host relays whose peers may not have
+    the optional msgpack package installed. The default preserves the original
+    direct-channel behavior.
+    """
+    encoding = str(encoding or "").strip().lower()
+    if encoding == "json":
+        return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    if encoding not in ("", "msgpack"):
+        raise ValueError("unsupported quote push encoding: %s" % encoding)
     if _HAS_MSGPACK:
         return msgpack.packb(payload, use_bin_type=True)
     return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -281,7 +291,7 @@ def _unique_accounts(values):
 
 
 class RedisQuotePushChannel(QuotePushChannel):
-    def __init__(self, redis_client, account_id="", channel_template="bigqmt:quote_push:{account_id}:{topic}", print_prefix="[bigqmt_quote_push]", account_ids=None):
+    def __init__(self, redis_client, account_id="", channel_template="bigqmt:quote_push:{account_id}:{topic}", print_prefix="[bigqmt_quote_push]", account_ids=None, wire_encoding=None, raise_publish_errors=False):
         self.redis = redis_client
         self.account_id = str(account_id or "")
         self.channel_template = channel_template
@@ -295,6 +305,8 @@ class RedisQuotePushChannel(QuotePushChannel):
         # no callbacks". Market data is not account-specific, so publish
         # once per account. The client role uses account_id alone.
         self.account_ids = _unique_accounts([self.account_id] + list(account_ids or []))
+        self.wire_encoding = wire_encoding
+        self.raise_publish_errors = bool(raise_publish_errors)
         self._running = False
         self._pubsub = None
         self._thread = None
@@ -310,12 +322,21 @@ class RedisQuotePushChannel(QuotePushChannel):
         self._running = True
 
     def publish(self, topic, data):
-        payload = encode_push_payload({"combo_key": topic, "data": data})
+        payload = encode_push_payload(
+            {"combo_key": topic, "data": data},
+            encoding=self.wire_encoding,
+        )
+        first_error = None
         for account_id in self.account_ids or [self.account_id]:
             try:
                 self.redis.publish(self._channel(topic, account_id), payload)
             except Exception as exc:
-                print("%s redis publish failed: %s" % (self.print_prefix, exc))
+                if first_error is None:
+                    first_error = exc
+                if not self.raise_publish_errors:
+                    print("%s redis publish failed: %s" % (self.print_prefix, exc))
+        if first_error is not None and self.raise_publish_errors:
+            raise first_error
 
     # -- client side ---------------------------------------------------------
     def start_subscriber(self, topics, on_msg):

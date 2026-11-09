@@ -1,6 +1,7 @@
 # coding: utf-8
 import os
 import sys
+import threading
 import time
 import unittest
 
@@ -20,7 +21,6 @@ class FakeRedis(object):
 
     def eval(self, script, key_count, *args):
         if "XADD" in script:
-            event_id = args[0].rsplit(":", 1)[-1]
             # Use the full dedup key because event IDs themselves contain ':'.
             dedup_key = args[0]
             if dedup_key in self.event_ids:
@@ -102,6 +102,18 @@ class FakeQuoteRedisChannel(object):
 
     def stop(self):
         self.stopped = True
+
+
+class BlockingQuoteRedisChannel(FakeQuoteRedisChannel):
+    def __init__(self):
+        super(BlockingQuoteRedisChannel, self).__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def publish(self, topic, data):
+        self.entered.set()
+        self.release.wait(1.0)
+        super(BlockingQuoteRedisChannel, self).publish(topic, data)
 
 
 class FakeRedisTransport(object):
@@ -227,23 +239,154 @@ class RedisPipeProxyTest(unittest.TestCase):
         self.assertEqual(response["event_error"], "ACCOUNT_MISMATCH")
         self.assertEqual(redis.events, [])
 
-    def test_quote_push_relay_forwards_quote_topics_and_filters_exec_topics(self):
+    def test_quote_push_relay_forwards_quotes_and_execution_fallback(self):
         quote_pipe = FakeQuotePipe()
         quote_redis = FakeQuoteRedisChannel()
-        proxy, _redis, _replies = self.make_proxy(
+        proxy, redis, _replies = self.make_proxy(
             quote_push_relay=True,
             quote_pipe=quote_pipe,
             quote_redis_channel=quote_redis,
         )
+        proxy._start_quote_relay()
 
         proxy._handle_quote_push("000001.SZ", {"000001.SZ": {"lastPrice": 10.0}})
-        proxy._handle_quote_push("exec:trade", {"trade_id": "T1"})
+        proxy._handle_quote_push(
+            "exec:trade",
+            {"event_id": "fallback:1", "trade_id": "T1"},
+        )
         proxy._handle_quote_push("000002.SZ", "not-a-dict")
 
+        self.assertTrue(wait_for(lambda: len(quote_redis.published) == 1))
+        self.assertTrue(wait_for(lambda: len(redis.events) == 1))
         self.assertEqual(
             quote_redis.published,
             [("000001.SZ", {"000001.SZ": {"lastPrice": 10.0}})],
         )
+        self.assertIn("bigqmt:trade_events:acct", redis.events[0][0])
+
+    def test_quote_pipe_reader_is_not_blocked_by_slow_redis_publish(self):
+        quote_redis = BlockingQuoteRedisChannel()
+        proxy, _redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_pipe=FakeQuotePipe(),
+            quote_redis_channel=quote_redis,
+        )
+        proxy._start_quote_relay()
+
+        started = time.time()
+        proxy._handle_quote_push("SH", {"600000.SH": {"lastPrice": 10.0}})
+        elapsed = time.time() - started
+
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(quote_redis.entered.wait(1.0))
+        quote_redis.release.set()
+
+    def test_quote_overload_keeps_latest_data_and_drops_oldest_topic(self):
+        proxy, _redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_queue_capacity=1,
+            quote_pipe=FakeQuotePipe(),
+            quote_redis_channel=FakeQuoteRedisChannel(),
+        )
+
+        proxy._handle_quote_push("SH", {"v": 1})
+        proxy._handle_quote_push("SH", {"v": 2})
+        proxy._handle_quote_push("SZ", {"v": 3})
+
+        self.assertEqual(proxy._quote_pending, {"SZ": {"v": 3}})
+        self.assertEqual(proxy._quote_dropped, 1)
+
+    def test_all_execution_fallback_topics_map_to_redis_event_types(self):
+        proxy, _redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_pipe=FakeQuotePipe(),
+            quote_redis_channel=FakeQuoteRedisChannel(),
+        )
+        expected = {
+            "exec:order": "order",
+            "exec:trade": "trade",
+            "exec:order_error": "order_error",
+            "exec:cancel_error": "cancel_error",
+        }
+
+        for index, (topic, event_type) in enumerate(expected.items()):
+            proxy._handle_quote_push(topic, {"event_id": "e:%d" % index})
+            event = proxy._quote_exec_events.get_nowait()
+            self.assertEqual(event["event_type"], event_type)
+            self.assertEqual(event["account_id"], "acct")
+
+    def test_default_proxy_relay_publisher_forces_json_and_surfaces_errors(self):
+        proxy, _redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_pipe=FakeQuotePipe(),
+        )
+
+        self.assertEqual(proxy._quote_redis_channel.wire_encoding, "json")
+        self.assertTrue(proxy._quote_redis_channel.raise_publish_errors)
+
+    def test_execution_fallback_retries_redis_without_dropping_event(self):
+        class FlakyRedis(FakeRedis):
+            def __init__(self):
+                super(FlakyRedis, self).__init__()
+                self.failures_left = 1
+
+            def eval(self, script, key_count, *args):
+                if self.failures_left:
+                    self.failures_left -= 1
+                    raise RuntimeError("redis unavailable")
+                return super(FlakyRedis, self).eval(script, key_count, *args)
+
+        redis = FlakyRedis()
+        quote_redis = FakeQuoteRedisChannel()
+        proxy = RedisPipeProxy(
+            redis,
+            "acct",
+            workers=1,
+            max_pending=1,
+            rpc_pipe=FakeRpcPipe(),
+            event_pipe=FakeEventPipe(),
+            redis_transport=FakeRedisTransport(),
+            shutdown_grace_seconds=0,
+            quote_push_relay=True,
+            quote_pipe=FakeQuotePipe(),
+            quote_redis_channel=quote_redis,
+        )
+        self.addCleanup(proxy.stop)
+        proxy._running = True
+        proxy._accepting = True
+        proxy._start_quote_relay()
+
+        proxy._handle_quote_push(
+            "exec:cancel_error",
+            {"event_id": "fallback:2", "error_msg": "refused"},
+        )
+
+        self.assertTrue(wait_for(lambda: len(redis.events) == 1, timeout=2.0))
+        self.assertEqual(proxy._quote_exec_failures, 1)
+        self.assertIn("bigqmt:cancel_error_events:acct", redis.events[0][0])
+
+    def test_late_primary_and_fallback_delivery_are_deduplicated(self):
+        proxy, redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_pipe=FakeQuotePipe(),
+            quote_redis_channel=FakeQuoteRedisChannel(),
+        )
+        proxy._start_quote_relay()
+        primary = request("publish_exec_event")
+        primary["request_id"] = "shared:event:1"
+        primary["params"] = {
+            "event": {"event_type": "order", "order_id": "O1"},
+        }
+
+        self.assertTrue(proxy._handle_event(primary)["ok"])
+        proxy._handle_quote_push(
+            "exec:order",
+            {"event_id": "shared:event:1", "order_id": "O1"},
+        )
+
+        self.assertTrue(wait_for(lambda: proxy._quote_exec_events.empty()))
+        time.sleep(0.05)
+        self.assertEqual(len(redis.events), 1)
 
     def test_quote_push_relay_lifecycle_starts_and_stops_both_channels(self):
         quote_pipe = FakeQuotePipe()
