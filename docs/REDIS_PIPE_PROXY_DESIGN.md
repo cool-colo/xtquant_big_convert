@@ -727,8 +727,9 @@ Whole-quote data uses a dedicated one-way named pipe derived from the RPC pipe
 name (`bigqmt_rpc_events_<account>`). The external proxy subscribes to that pipe
 and republishes non-`exec:*` topics onto the existing account-scoped Redis quote
 channels. Execution events remain on their acknowledged event pipe. The relay
-is opt-in on both QMT and proxy, so upgraded deployments retain polling until
-operators enable all push switches.
+remains opt-in for ordinary QMT package deployments and for the proxy. The
+generated `BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py` deployment artifact is the
+explicit push variant and therefore embeds `quote_push.enabled=True`.
 
 ### 10.4 Redis-backed storage
 

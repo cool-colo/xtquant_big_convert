@@ -9,8 +9,8 @@
 与 no-redis 版的差异：
 - 不替换 zmq_transport（pipe_transport 本来就在包里，ctypes/kernel32 零依赖）；
 - 不内嵌 bigqmt_no_redis/；
-- 强制 transport=pipe + redis_enabled=False；quote_push 默认关、可显式开启并
-  走独立本机 events 管道；执行事件也走本机管道；download_jobs /
+- 强制 transport=pipe + redis_enabled=False；quote_push 直接开启并走独立
+  本机 events 管道；执行事件也走本机管道；download_jobs /
   full_tick_cache 关
   （这两个需要 redis）。
 
@@ -75,9 +75,8 @@ can copy this one file to a QMT python directory and run it as a strategy
 without shipping the package alongside.
 
 Execution callbacks use a dedicated local named pipe to the Redis proxy.
-Whole-quote push (subscribe_whole_quote) can use the local events pipe when
-quote_push.enabled=True; it remains opt-in so existing polling deployments
-continue unchanged.
+Whole-quote push (subscribe_whole_quote) uses the local events pipe and is
+enabled directly in this generated deployment file.
 
 Edit BIGQMT_ACCOUNT_ID below before running.
 """)
@@ -119,10 +118,10 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     # Nothing here may dial out: redis 块不下发（懒 client 首个命令就 connect，
     # EDR 抓到就杀进程，2026-09-24 实盘）。
     BIGQMT_REDIS_CONFIG["redis_enabled"] = False
-    # 全推行情可走独立 events pipe。默认仍关闭，部署显式配置
-    # quote_push.enabled=True 后才启用，便于旧环境无损升级。
+    # 此 pipe 单文件就是全链路推送部署产物，直接开启独立 events pipe 行情。
     _quote_push = dict(BIGQMT_REDIS_CONFIG.get("quote_push") or {})
-    _quote_push.setdefault("enabled", False)
+    _quote_push["enabled"] = True
+    _quote_push.setdefault("heartbeat_timeout_seconds", 30.0)
     BIGQMT_REDIS_CONFIG["quote_push"] = _quote_push
     BIGQMT_REDIS_CONFIG["exec_events_enabled"] = True
     BIGQMT_REDIS_CONFIG["exec_events_transport"] = "pipe"

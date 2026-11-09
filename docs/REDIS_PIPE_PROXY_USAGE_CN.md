@@ -106,8 +106,8 @@ python tools/build_pipe_single_file_flat.py
 ```
 
 生成文件为 `src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py`。它已内嵌事件管道
-实现，并强制关闭 QMT 端 Redis、ZMQ；行情全推是否开启由本地
-`quote_push.enabled` 决定，默认关闭。该文件使用 GBK 编码，需要复制到 QMT
+实现，并强制关闭 QMT 端 Redis、ZMQ；当前生成的 pipe 单文件已直接设置
+`quote_push.enabled=True`。该文件使用 GBK 编码，需要复制到 QMT
 策略目录并设置正确账号。
 
 若环境禁止写日志，先在 PowerShell 中设置用户环境变量，然后完全退出并重新
