@@ -14,23 +14,24 @@ Windows 命名管道，不创建 Redis、ZMQ 或原生 `xtdata` 网络连接。
 ```text
 Linux / NautilusTrader
         |
-        | Redis RPC 与执行事件
+        | Redis RPC、执行事件与行情 Pub/Sub
         v
 Redis <- Windows 独立代理进程
              |              ^
-             | RPC 管道     | 执行事件管道
+             | RPC 管道     | 执行事件/行情管道
              v              |
          QMT 内嵌策略进程
 ```
 
-每个资金账号运行一个代理进程，对应两条本机管道：
+每个资金账号运行一个代理进程，对应三条本机管道：
 
 - RPC：`\\.\pipe\bigqmt_rpc_<account_id>`
 - 执行事件：`\\.\pipe\bigqmt_exec_<account_id>`
+- 行情推送：`\\.\pipe\bigqmt_rpc_events_<account_id>`
 
-行情全推不经过代理。NautilusTrader 必须关闭 `use_quote_push`，通过 RPC 轮询
-行情。订单、成交和错误事件则由 QMT 回调经事件管道实时转发；Nautilus 的
-1 秒执行轮询仅用于对账和补漏，不是主事件通道。
+开启 `--quote-push-relay` 后，代理把 QMT 行情 events pipe 转发到现有 Redis
+行情 Pub/Sub。订单、成交和错误事件仍由带确认的独立执行事件管道转发；
+Nautilus 的 1 秒执行轮询仅用于对账和补漏，不是主事件通道。
 
 ## 2. 前置条件
 
@@ -85,7 +86,8 @@ BIGQMT_REDIS_CONFIG = {
     "native_xtdata_enabled": False,
     "download_jobs_enabled": False,
     "full_tick_cache_enabled": False,
-    "quote_push": {"enabled": False},
+    # 行情全链路推送；旧部署可保持 False 继续轮询。
+    "quote_push": {"enabled": True, "heartbeat_timeout_seconds": 30.0},
 
     # 原生订单/成交回调经独立管道发给代理。
     "exec_events_enabled": True,
@@ -104,8 +106,9 @@ python tools/build_pipe_single_file_flat.py
 ```
 
 生成文件为 `src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py`。它已内嵌事件管道
-实现，并强制关闭 QMT 端 Redis、ZMQ 和行情全推。该文件使用 GBK 编码且被
-Git 忽略，需要复制到 QMT 策略目录并设置正确账号。
+实现，并强制关闭 QMT 端 Redis、ZMQ；行情全推是否开启由本地
+`quote_push.enabled` 决定，默认关闭。该文件使用 GBK 编码，需要复制到 QMT
+策略目录并设置正确账号。
 
 若环境禁止写日志，先在 PowerShell 中设置用户环境变量，然后完全退出并重新
 启动 QMT，使 QMT 进程继承该变量：
@@ -134,6 +137,7 @@ bigqmt-redis-pipe-proxy `
   --redis-password-env BIGQMT_REDIS_PASSWORD `
   --pipe-name bigqmt_rpc `
   --event-pipe-name bigqmt_exec `
+  --quote-push-relay `
   --workers 8 `
   --max-pending 64
 ```
@@ -143,7 +147,8 @@ bigqmt-redis-pipe-proxy `
 ```powershell
 bigqmt-redis-pipe-proxy `
   --account-id "你的账号ID" `
-  --redis-url "redis://10.0.0.20:6379/5"
+  --redis-url "redis://10.0.0.20:6379/5" `
+  --quote-push-relay
 ```
 
 不要在 `--redis-url` 中放入用户名或密码：命令行参数可能被进程查看工具或日志
@@ -170,6 +175,7 @@ ACL 用户名，再加 `--redis-username`。
 | `--safety-margin` | 0.10 秒 | 转发前保留的超时安全边界 |
 | `--legacy-read-timeout` | 30 秒 | 无有效超时的旧读取和撤单请求上限 |
 | `--event-max-bytes` | 1 MiB | 单个执行事件最大尺寸 |
+| `--quote-push-relay` | 关闭 | 把行情 events pipe 转发到 Redis Pub/Sub |
 | `--event-dedup-ttl` | 86400 秒 | 事件 ID 去重窗口 |
 | `--shutdown-grace` | 10 秒 | 停机时等待已接收任务的时间 |
 
@@ -190,9 +196,11 @@ BigQMTDataClientConfig(
     redis_password=REDIS_PASSWORD,
     transport="redis",
     rpc_timeout_secs=6.0,
-    use_quote_push=False,
-    poll_enabled=True,
+    use_quote_push=True,
+    poll_enabled=False,
     poll_interval_secs=MARKET_POLL_INTERVAL,
+    quote_push_stale_after_secs=30.0,
+    quote_push_fallback_poll_interval_secs=60.0,
 )
 
 BigQMTExecClientConfig(
@@ -209,8 +217,9 @@ BigQMTExecClientConfig(
 )
 ```
 
-`MARKET_POLL_INTERVAL` 必须根据订阅代码数量和实测 QMT 吞吐量确定。报价和
-深度订阅会分别调用 `get_full_tick`，同一代码可能产生两次轮询。
+健康推送期间不会周期调用 `get_full_tick`。连续 30 秒无推送时客户端先重放
+订阅；累计 60 秒仍未恢复，则每 60 秒对当前订阅并集批量拉取一次快照，收到
+有效推送后立即退出兜底。QuoteTick 和深度订阅共享一份上游 full-tick 推送。
 
 验收期间设置 `BIGQMT_FORMULA_ENABLED=0`，避免 FormulaServer 快速路径绕过
 Redis—代理—管道链路。

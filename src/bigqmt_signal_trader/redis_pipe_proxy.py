@@ -13,8 +13,10 @@ import uuid
 
 from .adapters.redis_common import EVENT_STREAM_TTL_SECONDS, build_redis_client
 from .exec_event_pipe import PUBLISH_EXEC_EVENT_METHOD
+from .quote_push_channel import RedisQuotePushChannel
 from .redis_rpc import METHOD_ALIASES
 from .transports.base import TransportError, TransportTimeout
+from .transports.pipe_push_channel import PipeQuotePushChannel, pipe_events_path
 from .transports.pipe_transport import NamedPipeTransport
 from .transports.redis_transport import RedisTransport, _loads
 
@@ -93,7 +95,9 @@ class RedisPipeProxy(object):
                  legacy_read_timeout_seconds=30.0, shutdown_grace_seconds=10.0,
                  event_max_bytes=1024 * 1024, event_dedup_ttl_seconds=86400,
                  lock_ttl_seconds=15, lock_renew_seconds=5,
-                 rpc_pipe=None, event_pipe=None, redis_transport=None, log=None):
+                 quote_push_relay=False, rpc_pipe=None, event_pipe=None,
+                 redis_transport=None, quote_pipe=None, quote_redis_channel=None,
+                 log=None):
         self.redis = redis_client
         self.account_id = str(account_id or "")
         if not self.account_id:
@@ -107,6 +111,7 @@ class RedisPipeProxy(object):
         self.event_dedup_ttl_seconds = max(1, int(event_dedup_ttl_seconds))
         self.lock_ttl_seconds = max(3, int(lock_ttl_seconds))
         self.lock_renew_seconds = max(0.2, float(lock_renew_seconds))
+        self.quote_push_relay = bool(quote_push_relay)
         self._log = log or (lambda message: print("[bigqmt_proxy] %s" % message))
         self._rpc_pipe = rpc_pipe or NamedPipeTransport(
             account_id=self.account_id,
@@ -124,6 +129,21 @@ class RedisPipeProxy(object):
             response_redis_client=redis_client,
             print_prefix="[bigqmt_proxy]",
         )
+        self._quote_pipe = quote_pipe
+        self._quote_redis_channel = quote_redis_channel
+        if self.quote_push_relay:
+            self._quote_pipe = self._quote_pipe or PipeQuotePushChannel(
+                connect_address=pipe_events_path(pipe_name, self.account_id),
+                print_prefix="[bigqmt_proxy_quote_pipe]",
+            )
+            self._quote_redis_channel = (
+                self._quote_redis_channel
+                or RedisQuotePushChannel(
+                    redis_client,
+                    account_id=self.account_id,
+                    print_prefix="[bigqmt_proxy_quote_redis]",
+                )
+            )
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.workers, thread_name_prefix="bigqmt-proxy"
         )
@@ -208,6 +228,12 @@ class RedisPipeProxy(object):
             self._stop_event.clear()
             self._running = True
             self._event_pipe.start_receiving(self._handle_event, background_threads=True)
+            if self.quote_push_relay:
+                self._quote_redis_channel.start_publisher()
+                # An empty topic list accepts every pipe topic. Quote frames are
+                # selected in _handle_quote_push; exec:* continues over the
+                # acknowledged execution-event pipe.
+                self._quote_pipe.start_subscriber([], self._handle_quote_push)
             with self._state_lock:
                 self._accepting = True
             self._redis_transport.start_receiving(self._ingress, background_threads=True)
@@ -222,6 +248,7 @@ class RedisPipeProxy(object):
                 self._event_pipe.stop()
             except Exception:
                 pass
+            self._stop_quote_relay()
             self._release_lock()
             raise
         self._log("ready account=%s workers=%d max_pending=%d" % (
@@ -427,6 +454,28 @@ class RedisPipeProxy(object):
             self.event_dedup_ttl_seconds,
         )
 
+    def _handle_quote_push(self, topic, data):
+        """Relay one QMT pipe quote frame onto the existing Redis quote channel."""
+        topic = str(topic or "")
+        if not topic or topic.startswith("exec:"):
+            return
+        if not isinstance(data, dict):
+            self._log_error("discarded invalid quote push topic=%s" % topic)
+            return
+        try:
+            self._quote_redis_channel.publish(topic, data)
+        except Exception as exc:
+            self._log_error("quote Redis publish failed topic=%s: %s" % (topic, exc))
+
+    def _stop_quote_relay(self):
+        for channel in (self._quote_pipe, self._quote_redis_channel):
+            if channel is None:
+                continue
+            try:
+                channel.stop()
+            except Exception:
+                pass
+
     def stop(self):
         with self._state_lock:
             self._accepting = False
@@ -436,6 +485,7 @@ class RedisPipeProxy(object):
             self._event_pipe.stop()
         except Exception:
             pass
+        self._stop_quote_relay()
         deadline = time.time() + self.shutdown_grace_seconds
         while time.time() < deadline:
             with self._state_lock:
@@ -470,6 +520,11 @@ def _parser():
     parser.add_argument("--redis-password-env", default="BIGQMT_REDIS_PASSWORD")
     parser.add_argument("--pipe-name", default="bigqmt_rpc")
     parser.add_argument("--event-pipe-name", default="bigqmt_exec")
+    parser.add_argument(
+        "--quote-push-relay",
+        action="store_true",
+        help="Relay the QMT quote-events pipe to BigQMT Redis quote Pub/Sub.",
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-pending", type=int, default=64)
     parser.add_argument("--pipe-connect-timeout", type=float, default=0.25)
@@ -502,6 +557,7 @@ def main(argv=None):
         account_id=args.account_id,
         pipe_name=args.pipe_name,
         event_pipe_name=args.event_pipe_name,
+        quote_push_relay=args.quote_push_relay,
         workers=args.workers,
         max_pending=args.max_pending,
         pipe_connect_timeout_seconds=args.pipe_connect_timeout,

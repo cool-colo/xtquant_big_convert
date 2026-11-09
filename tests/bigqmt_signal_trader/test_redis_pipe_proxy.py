@@ -30,6 +30,15 @@ class FakeRedis(object):
             return 1
         return 1
 
+    def set(self, *args, **kwargs):
+        return True
+
+    def llen(self, _key):
+        return 0
+
+    def lpop(self, _key):
+        return None
+
     def close(self):
         self.closed = True
 
@@ -58,8 +67,41 @@ class FakeRpcPipe(object):
 
 
 class FakeEventPipe(object):
+    def start_receiving(self, callback, background_threads=True):
+        self.callback = callback
+
     def stop(self):
         pass
+
+
+class FakeQuotePipe(object):
+    def __init__(self):
+        self.topics = None
+        self.callback = None
+        self.stopped = False
+
+    def start_subscriber(self, topics, callback):
+        self.topics = list(topics)
+        self.callback = callback
+
+    def stop(self):
+        self.stopped = True
+
+
+class FakeQuoteRedisChannel(object):
+    def __init__(self):
+        self.started = False
+        self.published = []
+        self.stopped = False
+
+    def start_publisher(self):
+        self.started = True
+
+    def publish(self, topic, data):
+        self.published.append((topic, data))
+
+    def stop(self):
+        self.stopped = True
 
 
 class FakeRedisTransport(object):
@@ -70,6 +112,9 @@ class FakeRedisTransport(object):
 
     def send_response(self, request, response):
         self.responses.append((request, response))
+
+    def start_receiving(self, callback, background_threads=True):
+        self.callback = callback
 
     def stop(self):
         pass
@@ -96,13 +141,14 @@ def wait_for(predicate, timeout=1.0):
 
 
 class RedisPipeProxyTest(unittest.TestCase):
-    def make_proxy(self, pipe=None):
+    def make_proxy(self, pipe=None, **kwargs):
         redis = FakeRedis()
         replies = FakeRedisTransport()
         proxy = RedisPipeProxy(
             redis, "acct", workers=1, max_pending=1,
             rpc_pipe=pipe or FakeRpcPipe(), event_pipe=FakeEventPipe(),
             redis_transport=replies, shutdown_grace_seconds=0,
+            **kwargs
         )
         self.addCleanup(proxy.stop)
         proxy._running = True
@@ -180,6 +226,44 @@ class RedisPipeProxyTest(unittest.TestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["event_error"], "ACCOUNT_MISMATCH")
         self.assertEqual(redis.events, [])
+
+    def test_quote_push_relay_forwards_quote_topics_and_filters_exec_topics(self):
+        quote_pipe = FakeQuotePipe()
+        quote_redis = FakeQuoteRedisChannel()
+        proxy, _redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_pipe=quote_pipe,
+            quote_redis_channel=quote_redis,
+        )
+
+        proxy._handle_quote_push("000001.SZ", {"000001.SZ": {"lastPrice": 10.0}})
+        proxy._handle_quote_push("exec:trade", {"trade_id": "T1"})
+        proxy._handle_quote_push("000002.SZ", "not-a-dict")
+
+        self.assertEqual(
+            quote_redis.published,
+            [("000001.SZ", {"000001.SZ": {"lastPrice": 10.0}})],
+        )
+
+    def test_quote_push_relay_lifecycle_starts_and_stops_both_channels(self):
+        quote_pipe = FakeQuotePipe()
+        quote_redis = FakeQuoteRedisChannel()
+        proxy, _redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_pipe=quote_pipe,
+            quote_redis_channel=quote_redis,
+        )
+        proxy._running = False
+        proxy._accepting = False
+
+        proxy.start()
+        self.assertTrue(quote_redis.started)
+        self.assertEqual(quote_pipe.topics, [])
+        self.assertIsNotNone(quote_pipe.callback)
+
+        proxy.stop()
+        self.assertTrue(quote_pipe.stopped)
+        self.assertTrue(quote_redis.stopped)
 
 
 if __name__ == "__main__":

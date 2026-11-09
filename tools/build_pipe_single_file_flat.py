@@ -9,8 +9,9 @@
 与 no-redis 版的差异：
 - 不替换 zmq_transport（pipe_transport 本来就在包里，ctypes/kernel32 零依赖）；
 - 不内嵌 bigqmt_no_redis/；
-- 强制 transport=pipe + redis_enabled=False + quote_push 关；执行事件走独立
-  本机命名管道；download_jobs / full_tick_cache 关
+- 强制 transport=pipe + redis_enabled=False；quote_push 默认关、可显式开启并
+  走独立本机 events 管道；执行事件也走本机管道；download_jobs /
+  full_tick_cache 关
   （这两个需要 redis）。
 
 用法：python tools/build_pipe_single_file_flat.py，产物在
@@ -73,10 +74,10 @@ loader below resolves relative imports against the in-memory modules, so you
 can copy this one file to a QMT python directory and run it as a strategy
 without shipping the package alongside.
 
-Execution callbacks use a dedicated local named pipe to the Redis proxy;
-client-side polling remains a reconciliation fallback. Whole-quote push
-(subscribe_whole_quote) is disabled in this build -- poll get_full_tick
-instead.
+Execution callbacks use a dedicated local named pipe to the Redis proxy.
+Whole-quote push (subscribe_whole_quote) can use the local events pipe when
+quote_push.enabled=True; it remains opt-in so existing polling deployments
+continue unchanged.
 
 Edit BIGQMT_ACCOUNT_ID below before running.
 """)
@@ -118,9 +119,11 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     # Nothing here may dial out: redis 块不下发（懒 client 首个命令就 connect，
     # EDR 抓到就杀进程，2026-09-24 实盘）。
     BIGQMT_REDIS_CONFIG["redis_enabled"] = False
-    # 全推行情没有 pipe 推送线，客户端轮询 get_full_tick；执行回调走独立
-    # 本机 pipe，由外部 proxy 转发到 Redis。
-    BIGQMT_REDIS_CONFIG["quote_push"] = {"enabled": False}
+    # 全推行情可走独立 events pipe。默认仍关闭，部署显式配置
+    # quote_push.enabled=True 后才启用，便于旧环境无损升级。
+    _quote_push = dict(BIGQMT_REDIS_CONFIG.get("quote_push") or {})
+    _quote_push.setdefault("enabled", False)
+    BIGQMT_REDIS_CONFIG["quote_push"] = _quote_push
     BIGQMT_REDIS_CONFIG["exec_events_enabled"] = True
     BIGQMT_REDIS_CONFIG["exec_events_transport"] = "pipe"
     BIGQMT_REDIS_CONFIG.setdefault("exec_events_pipe_name", "bigqmt_exec")
@@ -130,7 +133,9 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     BIGQMT_REDIS_CONFIG.setdefault("download_jobs_enabled", False)
     BIGQMT_REDIS_CONFIG.setdefault("full_tick_cache_enabled", False)
     print("[bigqmt_shell] pipe mode: transport=pipe background_threads=%s "
-          "redis_enabled=False quote_push=False exec_events=pipe" % BIGQMT_REDIS_CONFIG["rpc_background_threads"])''')
+          "redis_enabled=False quote_push=%s exec_events=pipe" % (
+              BIGQMT_REDIS_CONFIG["rpc_background_threads"],
+              bool(BIGQMT_REDIS_CONFIG["quote_push"].get("enabled"))))''')
 
 assert "transport=pipe" in PIPE_TEMPLATE and '"transport": "pipe",' in PIPE_TEMPLATE, \
     "template replacements did not land"

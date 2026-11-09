@@ -143,12 +143,11 @@ execution client and two distinct four-worker clients. Acceptance tests must
 also prove explicit overload behavior; operators running more client
 instances must raise `workers`/`max_pending` or reduce polling fan-out.
 
-### 3.3 Required Nautilus configuration for version 1
+### 3.3 Nautilus configuration with quote-push relay
 
-Use Redis as the Nautilus-facing transport. Disable quote push because version
-1 does not relay the whole-quote channel. Keep both polling loops enabled as
-reconciliation/backstop paths; execution polling is not a substitute for the
-required execution-event relay:
+Use Redis as the Nautilus-facing transport. When the proxy runs with
+`--quote-push-relay` and QMT enables `quote_push`, market data uses whole-quote
+push while execution polling remains a reconciliation path:
 
 ```python
 BigQMTDataClientConfig(
@@ -158,9 +157,11 @@ BigQMTDataClientConfig(
     redis_db=5,
     transport="redis",
     rpc_timeout_secs=6.0,
-    use_quote_push=False,
-    poll_enabled=True,
+    use_quote_push=True,
+    poll_enabled=False,
     poll_interval_secs=MARKET_POLL_INTERVAL,
+    quote_push_stale_after_secs=30.0,
+    quote_push_fallback_poll_interval_secs=60.0,
 )
 
 BigQMTExecClientConfig(
@@ -176,12 +177,10 @@ BigQMTExecClientConfig(
 )
 ```
 
-`MARKET_POLL_INTERVAL` must be selected from the number of quote/depth
-subscriptions and the measured QMT capacity. The adapter default of 60 seconds
-is a slow backstop, not a real-time market-data setting. Version 1 must not be
-deployed with `use_quote_push=True` and `poll_enabled=False`: the method exists
-on the current client, so the adapter's structural capability check reports
-push support even though pipe mode has no push data channel.
+The data adapter replays a subscription after 30 seconds of push silence. If
+silence reaches 60 seconds, it fetches one batched full-tick snapshot every 60
+seconds until push recovers. Quote and depth consumers share the same upstream
+whole-quote subscription and snapshot batch.
 
 Disable FormulaServer routing (`BIGQMT_FORMULA_ENABLED=0`) during proxy
 acceptance tests so every asserted read traverses Redis, the proxy, and the
@@ -724,12 +723,12 @@ appears functional.
 
 ### 10.3 Whole-quote push
 
-Whole-quote data uses a separate Redis Pub/Sub or ZMQ PUB/SUB channel. The
-pipe RPC transport has no push channel, and the current pipe build installs a
-null/disabled quote channel. Relaying subscription-control RPCs alone cannot
-deliver ticks. The Nautilus adapter must use `use_quote_push=False` and poll
-`get_full_tick` in version 1. Its quote and depth subscriptions poll separately,
-so capacity tests must include both subscriptions for the same symbol.
+Whole-quote data uses a dedicated one-way named pipe derived from the RPC pipe
+name (`bigqmt_rpc_events_<account>`). The external proxy subscribes to that pipe
+and republishes non-`exec:*` topics onto the existing account-scoped Redis quote
+channels. Execution events remain on their acknowledged event pipe. The relay
+is opt-in on both QMT and proxy, so upgraded deployments retain polling until
+operators enable all push switches.
 
 ### 10.4 Redis-backed storage
 
