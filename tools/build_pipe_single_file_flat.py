@@ -95,6 +95,11 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     "native_xtdata_enabled": False,
     "pipe": {
         "pipe_name": "bigqmt_rpc",   # 管道名前缀，账号 id 自动拼在后面；客户端要一致
+    },
+    # 行情全链路推送：QMT callback -> events pipe -> Redis proxy。
+    "quote_push": {
+        "enabled": True,
+        "heartbeat_timeout_seconds": 30.0,
     },''')
 
 # --- 强制块：zmq 换成 pipe ---
@@ -136,7 +141,9 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
               BIGQMT_REDIS_CONFIG["rpc_background_threads"],
               bool(BIGQMT_REDIS_CONFIG["quote_push"].get("enabled"))))''')
 
-assert "transport=pipe" in PIPE_TEMPLATE and '"transport": "pipe",' in PIPE_TEMPLATE, \
+assert "transport=pipe" in PIPE_TEMPLATE and '"transport": "pipe",' in PIPE_TEMPLATE \
+    and '"quote_push": {' in PIPE_TEMPLATE \
+    and '"enabled": True,' in PIPE_TEMPLATE, \
     "template replacements did not land"
 
 
