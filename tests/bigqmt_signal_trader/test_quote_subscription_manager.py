@@ -91,6 +91,7 @@ class ContextInfoQuoteSourceTest(unittest.TestCase):
         self.assertEqual(context.calls, [(
             "subscribe_quote", "10010974.SHO", "tick", "none", "list",
         )])
+        self.assertIsInstance(received[0]["10010974.SHO"].pop("_trace")["qmt_callback_ns"], int)
         self.assertEqual(received, [{
             "10010974.SHO": {
                 "time": 2,

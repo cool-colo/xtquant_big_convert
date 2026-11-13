@@ -23,6 +23,7 @@ import json
 import threading
 import time
 
+from ..tick_trace import stamp_quote_batch, unix_time_ns
 from .pipe_transport import (
     _BUFFER_BYTES,
     _CONNECT_POLL_SECONDS,
@@ -129,6 +130,8 @@ class PipeQuotePushChannel(object):
             if require_delivery:
                 raise RuntimeError("execution-event pipe publisher is not running")
             return 0
+        if not require_delivery:
+            data = stamp_quote_batch(data, "pipe_publish_ns", unix_time_ns())
         payload = json.dumps(
             {"topic": topic, "data": data},
             ensure_ascii=False, default=str).encode("utf-8")
@@ -248,6 +251,7 @@ class PipeQuotePushChannel(object):
                 try:
                     while not stopped.is_set():
                         raw = self._read_one_message(dll, wintypes, handle, buf)
+                        received_ns = unix_time_ns()
                         if raw is None:
                             # Server restart (reconnect) or stop() (the loop
                             # condition exits).
@@ -260,7 +264,12 @@ class PipeQuotePushChannel(object):
                         if topics and not any(topic.startswith(t) for t in topics):
                             continue
                         try:
-                            on_msg(topic, event.get("data"))
+                            data = event.get("data")
+                            if not topic.startswith("exec:"):
+                                data = stamp_quote_batch(
+                                    data, "proxy_pipe_received_ns", received_ns,
+                                )
+                            on_msg(topic, data)
                         except Exception as exc:
                             print("%s subscriber callback failed: %s"
                                   % (self.print_prefix, exc))

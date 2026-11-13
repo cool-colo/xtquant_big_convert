@@ -22,6 +22,7 @@ publish never stalls quote-thread state, and no callback can deadlock.
 import threading
 
 from .code_utils import normalize_stock_code
+from .tick_trace import stamp_quote_batch, unix_time_ns
 
 
 def normalize_subscription_code(code):
@@ -113,17 +114,26 @@ class ContextInfoQuoteSource(QuoteSourceAdapter):
 
         try:
             if whole_codes:
+                def on_whole_push(data):
+                    received_ns = unix_time_ns()
+                    on_push(stamp_quote_batch(
+                        data, "qmt_callback_ns", received_ns, start=True,
+                    ))
+
                 sub_id = self._context.subscribe_whole_quote(
-                    whole_codes, callback=on_push
+                    whole_codes, callback=on_whole_push
                 )
                 handles.append(checked_handle(
                     sub_id, "subscribe_whole_quote", whole_codes
                 ))
 
             def on_option_push(data):
+                received_ns = unix_time_ns()
                 batch = latest_quote_batch(data)
                 if batch:
-                    on_push(batch)
+                    on_push(stamp_quote_batch(
+                        batch, "qmt_callback_ns", received_ns, start=True,
+                    ))
 
             for code in option_codes:
                 sub_id = self._context.subscribe_quote(

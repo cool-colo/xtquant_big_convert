@@ -296,6 +296,26 @@ class RedisPipeProxyTest(unittest.TestCase):
         self.assertEqual(proxy._quote_pending, {"SZ": {"v": 3}})
         self.assertEqual(proxy._quote_dropped, 1)
 
+    def test_replacing_pending_quote_keeps_only_that_frames_trace(self):
+        quote_redis = FakeQuoteRedisChannel()
+        proxy, _redis, _replies = self.make_proxy(
+            quote_push_relay=True,
+            quote_pipe=FakeQuotePipe(),
+            quote_redis_channel=quote_redis,
+        )
+        older = {"600000.SH": {"lastPrice": 10, "_trace": {
+            "qmt_callback_ns": 100, "proxy_pipe_received_ns": 110,
+        }}}
+        newer = {"600000.SH": {"lastPrice": 11, "_trace": {
+            "qmt_callback_ns": 200, "proxy_pipe_received_ns": 210,
+        }}}
+        proxy._handle_quote_push("SH", older)
+        proxy._handle_quote_push("SH", newer)
+        proxy._start_quote_relay()
+        self.assertTrue(wait_for(lambda: len(quote_redis.published) == 1))
+        self.assertEqual(quote_redis.published, [("SH", newer)])
+        self.assertEqual(older["600000.SH"]["_trace"]["qmt_callback_ns"], 100)
+
     def test_all_execution_fallback_topics_map_to_redis_event_types(self):
         proxy, _redis, _replies = self.make_proxy(
             quote_push_relay=True,

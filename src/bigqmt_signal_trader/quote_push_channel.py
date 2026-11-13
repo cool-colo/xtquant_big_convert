@@ -20,6 +20,8 @@ import json
 import threading
 import time
 
+from .tick_trace import stamp_quote_batch, unix_time_ns
+
 try:
     import msgpack
 
@@ -322,6 +324,8 @@ class RedisQuotePushChannel(QuotePushChannel):
         self._running = True
 
     def publish(self, topic, data):
+        if not str(topic).startswith("exec:"):
+            data = stamp_quote_batch(data, "redis_publish_ns", unix_time_ns())
         payload = encode_push_payload(
             {"combo_key": topic, "data": data},
             encoding=self.wire_encoding,
@@ -363,6 +367,7 @@ class RedisQuotePushChannel(QuotePushChannel):
                 pubsub.subscribe(*channels)
                 while not stopped.is_set():
                     message = pubsub.get_message(timeout=0.2)
+                    received_ns = unix_time_ns()
                     if stopped.is_set():
                         break
                     if not message or message.get("type") != "message":
@@ -374,6 +379,10 @@ class RedisQuotePushChannel(QuotePushChannel):
                     data = decode_push_payload(message.get("data"))
                     payload_data = data.get("data") if isinstance(data, dict) else data
                     try:
+                        if not topic.startswith("exec:"):
+                            payload_data = stamp_quote_batch(
+                                payload_data, "adapter_redis_received_ns", received_ns,
+                            )
                         on_msg(topic, payload_data)
                     except Exception as exc:
                         print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
