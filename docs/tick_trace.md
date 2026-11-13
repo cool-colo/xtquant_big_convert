@@ -34,7 +34,15 @@ QMT 回调的每个原始 tick 字典新增 `_trace`，保留现有 `{code: tick
 - 事件为不可变 dataclass，可通过 `dataclasses.asdict(event)` 转为日志字段。
 - 不改变 QuoteTick/Depth10 类型、不落文件、不额外写 Redis；诊断异常不阻断行情处理。
 
-qapp 的策略可使用以下方式接入自己的异步日志队列（`tick_trace_queue` 由 qapp 创建）：
+qapp 的 BigQMT 启动入口已接入该开关和日志 Actor：在现有命令后加
+`--bigqmt-tick-trace`，或设置 `BIGQMT_TICK_TRACE_ENABLED=1`；
+`--no-bigqmt-tick-trace` 可以覆盖环境变量并关闭。默认关闭。
+启用后自动订阅并通过后台线程输出 `live_tick_trace {JSON}` 到现有 INFO 日志，
+无需手动添加策略回调。队列容量为 8192，满时丢弃诊断日志并累计计数。
+推送链路需已启用（qapp 的 `BIGQMT_USE_QUOTE_PUSH=1`），诊断开关不切换行情来源。
+使用细节见 qapp 的 `monitoring/tick_trace.md`。
+
+需要自定义日志处理时，可参考以下异步队列示例（`tick_trace_queue` 由消费者创建）：
 
 ```python
 from queue import Full
