@@ -22,6 +22,7 @@ publish never stalls quote-thread state, and no callback can deadlock.
 import threading
 
 from .code_utils import normalize_stock_code
+from .quote_diagnostics import QuoteDiagnostics
 from .tick_trace import stamp_quote_batch, unix_time_ns
 
 
@@ -199,6 +200,7 @@ class QuoteSubscriptionManager(object):
         self._lock = threading.RLock()
         self._combos = {}            # combo_key -> _Combo
         self._sub_index = {}         # (client_id, sub_id) -> combo_key
+        self._quote_diagnostics = QuoteDiagnostics(prefix="[bigqmt_quote_source]")
 
     # -- subscription lifecycle ---------------------------------------------
     def subscribe(self, client_id, sub_id, code_list):
@@ -214,11 +216,15 @@ class QuoteSubscriptionManager(object):
             if combo is None:
                 codes = sorted({normalize_subscription_code(c) for c in (code_list or [])
                                 if str(c or "").strip()} - {""})
-                # source.subscribe registers the on_push callback with big QMT; it
-                # does not call back into the manager, so it is safe under the lock.
-                handle = self._source.subscribe(codes, self._make_on_push(key))
-                combo = _Combo(key, codes, handle, key)
+                # Register routing before source.subscribe: some sources invoke
+                # the initial callback synchronously during registration.
+                combo = _Combo(key, codes, None, key)
                 self._combos[key] = combo
+                try:
+                    combo.handle = self._source.subscribe(codes, self._make_on_push(key, combo))
+                except Exception:
+                    self._combos.pop(key, None)
+                    raise
 
             combo.clients[(client_id, sub_id)] = now
             self._sub_index[(client_id, sub_id)] = key
@@ -352,19 +358,26 @@ class QuoteSubscriptionManager(object):
         return count
 
     # -- internals -------------------------------------------------------------
-    def _make_on_push(self, key):
+    def _make_on_push(self, key, subscribed_combo):
         def on_push(data):
             publisher = self._on_push_publisher
             if publisher is None:
                 return
             with self._lock:
                 combo = self._combos.get(key)
-                topic = combo.topic if combo is not None else None
+                # An old callback must not route through a newer subscription
+                # with the same key after unsubscribe/re-subscribe.
+                topic = combo.topic if combo is subscribed_combo else None
             if topic is None:
                 return
             # Publish outside the lock: it is network IO and must not stall the
             # quote thread or block reaper/RPC threads waiting on the lock.
-            publisher(topic, data)
+            try:
+                publisher(topic, data)
+            except Exception as exc:
+                # Do not throw back into QMT's native callback, especially
+                # during a synchronous initial subscription callback.
+                self._quote_diagnostics.report("publisher_failed", topic, exc)
 
         return on_push
 

@@ -3545,8 +3545,8 @@ class BigQmtXtData:
                 # waits for its first callback must not hang because the
                 # primer happened to come back empty.
                 callback(self._prime_snapshot(code_list))
-            except Exception:
-                pass
+            except Exception as exc:
+                session.report_primer_failure(exc)
         return sub_id
 
     def replay_whole_quote_subscriptions(self):

@@ -21,6 +21,7 @@ import threading
 import time
 
 from .tick_trace import stamp_quote_batch, unix_time_ns
+from .quote_diagnostics import QuoteDiagnostics
 
 try:
     import msgpack
@@ -307,8 +308,11 @@ class RedisQuotePushChannel(QuotePushChannel):
         # no callbacks". Market data is not account-specific, so publish
         # once per account. The client role uses account_id alone.
         self.account_ids = _unique_accounts([self.account_id] + list(account_ids or []))
-        self.wire_encoding = wire_encoding
+        self.wire_encoding = str(wire_encoding or "").strip().lower()
+        if self.wire_encoding not in ("", "json", "msgpack"):
+            raise ValueError("unsupported quote push encoding: %s" % wire_encoding)
         self.raise_publish_errors = bool(raise_publish_errors)
+        self._quote_diagnostics = QuoteDiagnostics(prefix=self.print_prefix)
         self._running = False
         self._pubsub = None
         self._thread = None
@@ -326,10 +330,27 @@ class RedisQuotePushChannel(QuotePushChannel):
     def publish(self, topic, data):
         if not str(topic).startswith("exec:"):
             data = stamp_quote_batch(data, "redis_publish_ns", unix_time_ns())
-        payload = encode_push_payload(
-            {"combo_key": topic, "data": data},
-            encoding=self.wire_encoding,
-        )
+        try:
+            payload = encode_push_payload(
+                {"combo_key": topic, "data": data}, encoding=self.wire_encoding,
+            )
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            if str(topic).startswith("exec:") or not isinstance(data, dict):
+                raise
+            # Healthy batches encode once. Inspect individual symbols only on
+            # encoding failure, so one malformed tick cannot poison retries.
+            valid = {}
+            for code, tick in data.items():
+                try:
+                    encode_push_payload({code: tick}, encoding=self.wire_encoding)
+                    valid[code] = tick
+                except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+                    self._quote_diagnostics.report("encode_symbol", "%s/%s" % (topic, code), exc)
+            if not valid:
+                return
+            payload = encode_push_payload(
+                {"combo_key": topic, "data": valid}, encoding=self.wire_encoding,
+            )
         first_error = None
         for account_id in self.account_ids or [self.account_id]:
             try:
@@ -376,8 +397,16 @@ class RedisQuotePushChannel(QuotePushChannel):
                     if isinstance(channel, bytes):
                         channel = channel.decode("utf-8", errors="ignore")
                     topic = str(channel).rsplit(":", 1)[-1]
-                    data = decode_push_payload(message.get("data"))
-                    payload_data = data.get("data") if isinstance(data, dict) else data
+                    try:
+                        data = decode_push_payload(message.get("data"))
+                        if not isinstance(data, dict):
+                            raise ValueError("expected push envelope dict")
+                        payload_data = data.get("data")
+                        if not isinstance(payload_data, dict):
+                            raise ValueError("expected push data dict")
+                    except Exception as exc:
+                        self._quote_diagnostics.report("decode_frame", topic, exc)
+                        continue
                     try:
                         if not topic.startswith("exec:"):
                             payload_data = stamp_quote_batch(
@@ -385,7 +414,7 @@ class RedisQuotePushChannel(QuotePushChannel):
                             )
                         on_msg(topic, payload_data)
                     except Exception as exc:
-                        print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+                        self._quote_diagnostics.report("callback_failed", topic, exc)
             except Exception as exc:
                 if not stopped.is_set():
                     # Retry every second -- quotes should come back fast -- but

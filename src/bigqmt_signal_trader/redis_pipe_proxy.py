@@ -11,10 +11,12 @@ import socket
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 from .adapters.redis_common import EVENT_STREAM_TTL_SECONDS, build_redis_client
 from .exec_event_pipe import PUBLISH_EXEC_EVENT_METHOD
 from .quote_push_channel import RedisQuotePushChannel
+from .quote_diagnostics import QuoteDiagnostics
 from .redis_rpc import METHOD_ALIASES
 from .transports.base import TransportError, TransportTimeout
 from .transports.pipe_push_channel import PipeQuotePushChannel, pipe_events_path
@@ -156,7 +158,13 @@ class RedisPipeProxy(object):
             )
         self._quote_topics = queue.Queue(maxsize=self.quote_queue_capacity)
         self._quote_pending = {}
+        self._quote_waiting = OrderedDict()
+        self._quote_queued = set()
+        self._quote_inflight = {}
+        self._quote_subscriptions = {}
+        self._quote_retired_topics = {}
         self._quote_pending_lock = threading.Lock()
+        self._quote_diagnostics = QuoteDiagnostics(log=self._log_error, prefix="quote relay")
         self._quote_exec_events = queue.Queue()
         self._quote_relay_stop = threading.Event()
         self._quote_publish_thread = None
@@ -406,11 +414,61 @@ class RedisPipeProxy(object):
                 self._log_error("unknown write outcome request_id=%s code=PIPE_PROTOCOL_ERROR" %
                                 original.get("request_id"))
             return
+        self._track_quote_response(forwarded, response)
         try:
             self._redis_transport.send_response(original, response)
         except Exception as exc:
             self._log_error("Redis reply failed request_id=%s: %s" % (
                 original.get("request_id"), exc))
+
+    def _track_quote_response(self, request, response):
+        """Discard pending quotes only after confirmed subscription removal."""
+        if not self.quote_push_relay or not response.get("ok"):
+            return
+        method = _canonical(request.get("method"))
+        if method not in ("subscribe_whole_quote", "unsubscribe_whole_quote",
+                          "unsubscribe_whole_quote_batch", "quote_unsubscribe_all"):
+            return
+        params = request.get("params") or {}
+        client_id = str(params.get("client_id") or "")
+        with self._quote_pending_lock:
+            if method == "subscribe_whole_quote":
+                result = response.get("data")
+                if not isinstance(result, dict) or not result.get("topic"):
+                    return
+                topic = str(result["topic"])
+                self._quote_subscriptions[(client_id, str(params.get("sub_id")))] = topic
+                self._quote_retired_topics.pop(topic, None)
+                return
+            if method == "quote_unsubscribe_all":
+                retired = (set(self._quote_subscriptions.values()) | set(self._quote_pending)
+                           | set(self._quote_inflight))
+                self._quote_subscriptions.clear()
+            else:
+                if method == "unsubscribe_whole_quote":
+                    ids = [params.get("sub_id")]
+                else:
+                    result = response.get("data")
+                    ids = result.get("released", []) if isinstance(result, dict) else []
+                retired = set()
+                for sub_id in ids:
+                    topic = self._quote_subscriptions.pop((client_id, str(sub_id)), None)
+                    if topic is not None:
+                        retired.add(topic)
+                retired.difference_update(self._quote_subscriptions.values())
+            for topic in retired:
+                # Ignore buffered, late frames during teardown. Expire these
+                # tombstones so historical subscription combinations do not
+                # accumulate indefinitely.
+                self._quote_retired_topics[topic] = time.monotonic() + 30.0
+                self._quote_pending.pop(topic, None)
+                self._quote_waiting.pop(topic, None)
+
+    def _prune_retired_quote_topics_locked(self):
+        now = time.monotonic()
+        for topic, deadline in list(self._quote_retired_topics.items()):
+            if deadline <= now:
+                self._quote_retired_topics.pop(topic)
 
     def _event_ack(self, request, ok, error=""):
         response = _response(request, ok, data={"accepted": bool(ok)}, error=error)
@@ -494,42 +552,58 @@ class RedisPipeProxy(object):
         """Queue one QMT events-pipe frame without performing Redis I/O."""
         topic = str(topic or "")
         if not topic:
+            self._quote_diagnostics.report("invalid_topic")
             return
         if not isinstance(data, dict):
-            self._log_error("discarded invalid quote push topic=%s" % topic)
+            self._quote_diagnostics.report("invalid_frame", topic)
             return
         if topic.startswith("exec:"):
             self._enqueue_exec_fallback(topic, data)
             return
+        if self._quote_relay_stop.is_set():
+            self._quote_diagnostics.increment("after_stop")
+            return
         self._enqueue_latest_quote(topic, data)
 
     def _enqueue_latest_quote(self, topic, data):
-        """Keep at most one queued frame per topic, replacing it with latest."""
+        """Coalesce incremental batches by symbol without blocking pipe reads."""
+        batch = {}
+        for code, tick in data.items():
+            if not isinstance(code, str) or not code or not isinstance(tick, dict):
+                self._quote_diagnostics.report("invalid_symbol", "%s/%s" % (topic, code))
+                continue
+            if not tick:
+                self._quote_diagnostics.report("empty_tick", "%s/%s" % (topic, code))
+                continue
+            batch[code] = dict(tick)
+        if not batch:
+            if not data:
+                self._quote_diagnostics.increment("empty_batch")
+            return
         with self._quote_pending_lock:
-            if topic in self._quote_pending:
-                self._quote_pending[topic] = data
+            self._prune_retired_quote_topics_locked()
+            if topic in self._quote_retired_topics:
+                self._quote_diagnostics.increment("retired_topic")
                 return
+            pending = self._quote_pending.setdefault(topic, {})
+            replaced = len(pending.keys() & batch.keys())
+            if replaced:
+                self._quote_diagnostics.increment("coalesced_symbols", replaced)
+            pending.update(batch)
+            if topic not in self._quote_queued:
+                self._quote_waiting.setdefault(topic, None)
+            self._fill_quote_topics_locked()
+
+    def _fill_quote_topics_locked(self):
+        """Schedule waiting topics fairly; a full ready queue never drops data."""
+        while self._quote_waiting:
+            topic = next(iter(self._quote_waiting))
             try:
                 self._quote_topics.put_nowait(topic)
             except queue.Full:
-                try:
-                    oldest = self._quote_topics.get_nowait()
-                except queue.Empty:
-                    oldest = None
-                if oldest is not None:
-                    self._quote_pending.pop(oldest, None)
-                self._quote_dropped += 1
-                if self._quote_dropped <= 3 or self._quote_dropped % 1000 == 0:
-                    self._log_error(
-                        "quote relay overloaded; dropped oldest topic "
-                        "dropped=%d capacity=%d"
-                        % (self._quote_dropped, self.quote_queue_capacity)
-                    )
-                try:
-                    self._quote_topics.put_nowait(topic)
-                except queue.Full:
-                    return
-            self._quote_pending[topic] = data
+                return
+            self._quote_waiting.pop(topic)
+            self._quote_queued.add(topic)
 
     def _enqueue_exec_fallback(self, topic, data):
         event_type = EXEC_TOPIC_TYPES.get(topic)
@@ -557,24 +631,48 @@ class RedisPipeProxy(object):
         self._quote_exec_events.put_nowait(event)
 
     def _quote_publish_loop(self):
+        consecutive_failures = 0
         while not self._quote_relay_stop.is_set():
             try:
                 topic = self._quote_topics.get(timeout=0.2)
             except queue.Empty:
+                with self._quote_pending_lock:
+                    self._prune_retired_quote_topics_locked()
                 continue
             with self._quote_pending_lock:
+                self._quote_queued.discard(topic)
                 data = self._quote_pending.pop(topic, None)
+                self._fill_quote_topics_locked()
+                if data is not None:
+                    self._quote_inflight[topic] = data
             if data is None:
                 continue
             try:
                 self._quote_redis_channel.publish(topic, data)
             except Exception as exc:
                 self._quote_publish_failures += 1
-                if self._quote_publish_failures <= 3 or self._quote_publish_failures % 100 == 0:
-                    self._log_error(
-                        "quote Redis publish failed x%d topic=%s: %s"
-                        % (self._quote_publish_failures, topic, exc)
-                    )
+                consecutive_failures += 1
+                self._quote_diagnostics.report("publish_failed", topic, exc)
+                with self._quote_pending_lock:
+                    if self._quote_relay_stop.is_set():
+                        # Keep the failed in-flight snapshot for shutdown's
+                        # unsent-symbol accounting, without restarting retries.
+                        continue
+                    self._quote_inflight.pop(topic, None)
+                    if topic not in self._quote_retired_topics:
+                        newer = self._quote_pending.get(topic, {})
+                        data.update(newer)
+                        self._quote_pending[topic] = data
+                        if topic not in self._quote_queued:
+                            self._quote_waiting.setdefault(topic, None)
+                        self._fill_quote_topics_locked()
+                self._quote_relay_stop.wait(min(1.0, 0.1 * consecutive_failures))
+            else:
+                with self._quote_pending_lock:
+                    self._quote_inflight.pop(topic, None)
+                if consecutive_failures:
+                    self._quote_diagnostics.report("publish_recovered", topic)
+                consecutive_failures = 0
 
     def _quote_exec_loop(self):
         current = None
@@ -598,21 +696,35 @@ class RedisPipeProxy(object):
                 self._quote_relay_stop.wait(0.25)
 
     def _stop_quote_relay(self):
-        # Stop intake first. Give healthy Redis a short chance to flush rare
-        # execution fallback frames, then stop workers without waiting through
-        # an unbounded Redis outage.
+        # Stop intake first, then give healthy Redis a bounded chance to flush
+        # latest quotes and execution fallback frames.
         if self._quote_pipe is not None:
             try:
                 self._quote_pipe.stop()
             except Exception:
                 pass
         deadline = time.time() + min(self.shutdown_grace_seconds, 2.0)
-        while not self._quote_exec_events.empty() and time.time() < deadline:
+        while time.time() < deadline:
+            with self._quote_pending_lock:
+                quotes_pending = bool(self._quote_pending or self._quote_inflight)
+            if not quotes_pending and self._quote_exec_events.empty():
+                break
             time.sleep(0.02)
         self._quote_relay_stop.set()
         for thread in (self._quote_publish_thread, self._quote_exec_thread):
             if thread is not None and thread.is_alive():
                 thread.join(2.0)
+        with self._quote_pending_lock:
+            remaining = {topic: set(batch) for topic, batch in self._quote_pending.items()}
+            for topic, batch in self._quote_inflight.items():
+                remaining.setdefault(topic, set()).update(batch)
+            if remaining:
+                self._quote_diagnostics.report(
+                    "shutdown_unsent", "topics=%d symbols=%d" %
+                    (len(remaining), sum(len(codes) for codes in remaining.values())))
+            self._quote_pending.clear()
+            self._quote_waiting.clear()
+            self._quote_inflight.clear()
         self._quote_publish_thread = None
         self._quote_exec_thread = None
         if self._quote_redis_channel is not None:
@@ -674,7 +786,7 @@ def _parser():
         "--quote-queue-capacity",
         type=int,
         default=4096,
-        help="Maximum distinct pending quote topics; newest data replaces older data.",
+        help="Ready-topic queue capacity; overflow stays pending and ticks coalesce per symbol.",
     )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-pending", type=int, default=64)

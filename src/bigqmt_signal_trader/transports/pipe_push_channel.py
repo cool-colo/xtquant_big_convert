@@ -24,6 +24,7 @@ import threading
 import time
 
 from ..tick_trace import stamp_quote_batch, unix_time_ns
+from ..quote_diagnostics import QuoteDiagnostics
 from .pipe_transport import (
     _BUFFER_BYTES,
     _CONNECT_POLL_SECONDS,
@@ -73,6 +74,7 @@ class PipeQuotePushChannel(object):
         self.subscriber_join_seconds = 1.0
         self._client_handle = None
         self._client_handle_lock = threading.Lock()
+        self._quote_diagnostics = QuoteDiagnostics(prefix=self.print_prefix)
 
     def _dll(self):
         return _kernel32()
@@ -258,7 +260,12 @@ class PipeQuotePushChannel(object):
                             break
                         try:
                             event = json.loads(raw.decode("utf-8"))
-                        except Exception:
+                            if not isinstance(event, dict):
+                                raise ValueError("expected push envelope dict")
+                            if not isinstance(event.get("data"), dict):
+                                raise ValueError("expected push data dict")
+                        except Exception as exc:
+                            self._quote_diagnostics.report("decode_frame", error=exc)
                             continue
                         topic = str(event.get("topic") or "")
                         if topics and not any(topic.startswith(t) for t in topics):
@@ -271,8 +278,7 @@ class PipeQuotePushChannel(object):
                                 )
                             on_msg(topic, data)
                         except Exception as exc:
-                            print("%s subscriber callback failed: %s"
-                                  % (self.print_prefix, exc))
+                            self._quote_diagnostics.report("callback_failed", topic, exc)
                 finally:
                     with self._client_handle_lock:
                         if self._client_handle is handle:
@@ -283,7 +289,8 @@ class PipeQuotePushChannel(object):
                         pass
                 if not stopped.is_set():
                     time.sleep(_CONNECT_POLL_SECONDS)
-        except Exception:
+        except Exception as exc:
+            self._quote_diagnostics.report("receiver_failed", error=exc)
             return
 
     def _stop_subscriber(self):

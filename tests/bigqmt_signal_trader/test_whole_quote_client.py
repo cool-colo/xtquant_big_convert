@@ -323,3 +323,20 @@ class SubIdsAreUniqueAcrossProcessesTest(unittest.TestCase):
         session.unsubscribe_quote(sub_id)
         self.assertEqual(("unsubscribe_whole_quote", sub_id),
                          (calls[-1][0], calls[-1][1]["sub_id"]))
+
+
+class CallbackIsolationTest(unittest.TestCase):
+    def test_failed_callback_is_counted_and_other_callback_receives_data(self):
+        channel = FakePushChannel()
+        session = WholeQuoteClientSession(FakeRpc(), channel, "client", heartbeat_interval_seconds=100)
+        self.addCleanup(session.stop)
+        def fail(data):
+            raise RuntimeError("bad callback")
+        received = []
+        session.subscribe_whole_quote(["SH"], fail)
+        session.subscribe_whole_quote(["SH"], received.append)
+        for _ in range(5): channel.inject("SH", {"A": {"v": 1}})
+        self.assertEqual(len(received), 5)
+        self.assertEqual(session._quote_diagnostics.counts["callback_failed"], 5)
+        session.report_primer_failure(RuntimeError("snapshot failed"))
+        self.assertEqual(session._quote_diagnostics.counts["primer_failed"], 1)

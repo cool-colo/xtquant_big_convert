@@ -281,7 +281,7 @@ class RedisPipeProxyTest(unittest.TestCase):
         self.assertTrue(quote_redis.entered.wait(1.0))
         quote_redis.release.set()
 
-    def test_quote_overload_keeps_latest_data_and_drops_oldest_topic(self):
+    def test_quote_overload_preserves_all_topics_and_latest_symbol(self):
         proxy, _redis, _replies = self.make_proxy(
             quote_push_relay=True,
             quote_queue_capacity=1,
@@ -289,12 +289,16 @@ class RedisPipeProxyTest(unittest.TestCase):
             quote_redis_channel=FakeQuoteRedisChannel(),
         )
 
-        proxy._handle_quote_push("SH", {"v": 1})
-        proxy._handle_quote_push("SH", {"v": 2})
-        proxy._handle_quote_push("SZ", {"v": 3})
+        proxy._handle_quote_push("SH", {"600000.SH": {"v": 1}})
+        proxy._handle_quote_push("SH", {"600000.SH": {"v": 2}})
+        proxy._handle_quote_push("SZ", {"000001.SZ": {"v": 3}})
 
-        self.assertEqual(proxy._quote_pending, {"SZ": {"v": 3}})
-        self.assertEqual(proxy._quote_dropped, 1)
+        self.assertEqual(proxy._quote_pending, {
+            "SH": {"600000.SH": {"v": 2}}, "SZ": {"000001.SZ": {"v": 3}}})
+        self.assertEqual(proxy._quote_dropped, 0)
+        proxy._start_quote_relay()
+        self.assertTrue(wait_for(lambda: len(proxy._quote_redis_channel.published) == 2))
+        self.assertEqual([topic for topic, _ in proxy._quote_redis_channel.published], ["SH", "SZ"])
 
     def test_replacing_pending_quote_keeps_only_that_frames_trace(self):
         quote_redis = FakeQuoteRedisChannel()
@@ -431,3 +435,154 @@ class RedisPipeProxyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuoteRecoveryTest(unittest.TestCase):
+    make_proxy = RedisPipeProxyTest.make_proxy
+
+    def test_incremental_symbols_merge_and_single_side_replaces_entire_tick(self):
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=FakeQuoteRedisChannel())
+        proxy._handle_quote_push("T", {"A": {"bidPrice": [10], "askPrice": [11], "_trace": {"n": 1}}})
+        proxy._handle_quote_push("T", {"B": {"lastPrice": 20}})
+        proxy._handle_quote_push("T", {"A": {"bidPrice": [10], "askPrice": [], "_trace": {"n": 2}}})
+        proxy._handle_quote_push("T", {})
+        proxy._handle_quote_push("T", {"A": {}, "bad": [1]})
+        proxy._start_quote_relay()
+        self.assertTrue(wait_for(lambda: len(proxy._quote_redis_channel.published) == 1))
+        batch = proxy._quote_redis_channel.published[0][1]
+        self.assertEqual(set(batch), {"A", "B"})
+        self.assertEqual(batch["A"]["askPrice"], [])
+        self.assertEqual(batch["A"]["_trace"], {"n": 2})
+        self.assertEqual(proxy._quote_diagnostics.counts["coalesced_symbols"], 1)
+
+    def test_publish_failure_retries_without_overwriting_newer_symbols(self):
+        channel = FakeQuoteRedisChannel()
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=channel)
+        calls = []
+        def publish(topic, data):
+            calls.append(data)
+            if len(calls) == 1:
+                proxy._handle_quote_push(topic, {"A": {"v": 2}, "C": {"v": 3}})
+                raise OSError("Redis unavailable")
+            if len(calls) == 2:
+                raise OSError("still unavailable")
+            channel.published.append((topic, data))
+        channel.publish = publish
+        proxy._handle_quote_push("T", {"A": {"v": 1}, "B": {"v": 1}})
+        proxy._start_quote_relay()
+        self.assertTrue(wait_for(lambda: len(channel.published) == 1, timeout=2.0))
+        self.assertEqual(channel.published[0][1], {"A": {"v": 2}, "B": {"v": 1}, "C": {"v": 3}})
+        self.assertEqual(proxy._quote_publish_failures, 2)
+        self.assertEqual(proxy._quote_pending, {})
+
+    def test_failed_topic_does_not_starve_other_topics_with_capacity_one(self):
+        channel = FakeQuoteRedisChannel()
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_queue_capacity=1,
+                                     quote_pipe=FakeQuotePipe(), quote_redis_channel=channel)
+        failed = []
+        def publish(topic, data):
+            if topic == "A" and not failed:
+                failed.append(topic)
+                raise OSError("one failure")
+            channel.published.append((topic, data))
+        channel.publish = publish
+        for topic in ["A", "B", "C"]:
+            proxy._handle_quote_push(topic, {topic: {"v": 1}})
+        proxy._start_quote_relay()
+        self.assertTrue(wait_for(lambda: len(channel.published) == 3))
+        self.assertEqual([topic for topic, _ in channel.published], ["B", "C", "A"])
+
+    def test_unencodable_symbol_does_not_block_healthy_symbols(self):
+        from bigqmt_signal_trader.quote_push_channel import RedisQuotePushChannel, decode_push_payload
+        class PublishingRedis:
+            def __init__(self): self.published = []
+            def publish(self, channel, payload):
+                self.published.append(decode_push_payload(payload))
+        redis = PublishingRedis()
+        channel = RedisQuotePushChannel(redis, "acct", wire_encoding="json", raise_publish_errors=True)
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=channel)
+        circular = {}; circular["self"] = circular
+        proxy._handle_quote_push("T", {"bad": circular, "good": {"v": 1}})
+        proxy._start_quote_relay()
+        self.assertTrue(wait_for(lambda: len(redis.published) == 1))
+        self.assertEqual(redis.published[0]["data"], {"good": {"v": 1}})
+        self.assertEqual(channel._quote_diagnostics.counts["encode_symbol"], 1)
+
+    def test_concurrent_batches_keep_every_symbols_latest_tick(self):
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=FakeQuoteRedisChannel())
+        def send(code):
+            for n in range(50):
+                proxy._handle_quote_push("T", {code: {"v": n}})
+        workers = [threading.Thread(target=send, args=(str(i),)) for i in range(12)]
+        for worker in workers: worker.start()
+        for worker in workers: worker.join()
+        self.assertEqual(proxy._quote_pending["T"], {str(i): {"v": 49} for i in range(12)})
+        self.assertEqual(proxy._quote_topics.qsize(), 1)
+
+    def test_only_final_subscription_removal_clears_pending_topic(self):
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=FakeQuoteRedisChannel())
+        def track(method, client):
+            proxy._track_quote_response({"method": method, "params": {"client_id": client, "sub_id": 1}},
+                                        {"ok": True, "data": {"topic": "T"}})
+        track("subscribe_whole_quote", "a")
+        track("subscribe_whole_quote", "b")
+        proxy._handle_quote_push("T", {"A": {"v": 1}})
+        track("unsubscribe_whole_quote", "a")
+        self.assertIn("T", proxy._quote_pending)
+        track("unsubscribe_whole_quote", "b")
+        self.assertNotIn("T", proxy._quote_pending)
+        proxy._handle_quote_push("T", {"A": {"v": 2}})
+        self.assertNotIn("T", proxy._quote_pending)
+        track("subscribe_whole_quote", "a")
+        proxy._handle_quote_push("T", {"A": {"v": 3}})
+        self.assertEqual(proxy._quote_pending["T"], {"A": {"v": 3}})
+
+    def test_shutdown_reports_unsent_latest_quotes(self):
+        logs = []
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=FakeQuoteRedisChannel(), log=logs.append)
+        proxy._handle_quote_push("T", {"A": {"v": 1}, "B": {"v": 2}})
+        proxy.stop()
+        self.assertTrue(any("shutdown_unsent" in message and "symbols=2" in message for message in logs))
+
+
+class QuoteShutdownRaceTest(unittest.TestCase):
+    make_proxy = RedisPipeProxyTest.make_proxy
+
+    def test_publish_failure_during_stop_is_counted_without_requeueing(self):
+        channel = FakeQuoteRedisChannel()
+        entered, release = threading.Event(), threading.Event()
+        def publish(topic, data):
+            entered.set()
+            release.wait(1.0)
+            raise OSError("failed during stop")
+        channel.publish = publish
+        logs = []
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=channel, log=logs.append)
+        proxy._handle_quote_push("T", {"A": {"v": 1}})
+        proxy._start_quote_relay()
+        self.assertTrue(entered.wait(1.0))
+        stopper = threading.Thread(target=proxy.stop)
+        stopper.start()
+        self.assertTrue(proxy._quote_relay_stop.wait(1.0))
+        release.set()
+        stopper.join(2.0)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(proxy._quote_pending, {})
+        self.assertTrue(any("shutdown_unsent" in message and "symbols=1" in message for message in logs))
+        proxy._handle_quote_push("T", {"A": {"v": 2}})
+        self.assertEqual(proxy._quote_pending, {})
+
+    def test_retired_topic_tombstones_expire_instead_of_accumulating(self):
+        proxy, _, _ = self.make_proxy(quote_push_relay=True, quote_pipe=FakeQuotePipe(),
+                                     quote_redis_channel=FakeQuoteRedisChannel())
+        proxy._quote_retired_topics["old"] = time.monotonic() - 1
+        with proxy._quote_pending_lock:
+            proxy._prune_retired_quote_topics_locked()
+        self.assertEqual(proxy._quote_retired_topics, {})

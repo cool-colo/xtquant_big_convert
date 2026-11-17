@@ -19,6 +19,7 @@ class FakeSession:
         self.started = False
         self._next = 0
         self._active = set()
+        self.primer_errors = []
 
     def subscribe_whole_quote(self, code_list, callback=None):
         self._next += 1
@@ -33,6 +34,9 @@ class FakeSession:
 
     def has_subscription(self, sub_id):
         return sub_id in self._active
+
+    def report_primer_failure(self, error):
+        self.primer_errors.append(error)
 
     def replay_subscriptions(self):
         self.replayed += 1
@@ -122,3 +126,15 @@ class XtDataWholeQuoteDelegationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrimerFailureTest(unittest.TestCase):
+    _xtdata = XtDataWholeQuoteDelegationTest._xtdata
+    def test_failed_primer_callback_is_reported_and_subscription_survives(self):
+        session = FakeSession()
+        data, _client = self._xtdata(session)
+        def fail(snapshot):
+            raise RuntimeError("primer callback failed")
+        sub_id = data.subscribe_whole_quote(["SH"], callback=fail)
+        self.assertTrue(session.has_subscription(sub_id))
+        self.assertEqual(len(session.primer_errors), 1)

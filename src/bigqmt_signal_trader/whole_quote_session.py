@@ -14,6 +14,8 @@ a ``get_full_tick`` prime on top (done in ``BigQmtXtData.subscribe_whole_quote``
 import os
 import threading
 
+from .quote_diagnostics import QuoteDiagnostics
+
 
 def _norm_topic(code_list):
     return ",".join(sorted({str(c).strip().upper() for c in (code_list or []) if str(c or "").strip()}))
@@ -44,6 +46,7 @@ class WholeQuoteClientSession(object):
         self._heartbeat_thread = None
         self._last_push_time = None  # monotonic time of last incoming push
         self._replay_pending = False  # a failed batch must finish despite other subscriptions pushing
+        self._quote_diagnostics = QuoteDiagnostics(prefix="[bigqmt_quote_session]")
 
     # -- subscription lifecycle ---------------------------------------------
     def subscribe_whole_quote(self, code_list, callback=None):
@@ -225,6 +228,9 @@ class WholeQuoteClientSession(object):
             time.sleep(self._heartbeat_interval)
 
     # -- push routing ------------------------------------------------------------
+    def report_primer_failure(self, error):
+        self._quote_diagnostics.report("primer_failed", error=error)
+
     def _on_push(self, topic, data):
         import time
 
@@ -239,8 +245,8 @@ class WholeQuoteClientSession(object):
         for callback in callbacks:
             try:
                 callback(data)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._quote_diagnostics.report("callback_failed", topic, exc)
 
     def _sync_subscriber_locked(self):
         """(Re)start the push-channel subscriber to cover exactly the active

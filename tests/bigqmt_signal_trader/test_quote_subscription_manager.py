@@ -293,3 +293,61 @@ class QuoteSubscriptionManagerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubscriptionCallbackRaceTest(unittest.TestCase):
+    def test_synchronous_initial_callback_has_topic_and_failed_subscribe_rolls_back(self):
+        class SynchronousSource(QuoteSourceAdapter):
+            fail = False
+            def subscribe(self, codes, on_push):
+                on_push({"A": {"v": 1}})
+                if self.fail:
+                    raise RuntimeError("subscribe failed")
+                return 1
+            def unsubscribe(self, handle):
+                pass
+        source = SynchronousSource()
+        received = []
+        manager = QuoteSubscriptionManager(source, on_push_publisher=lambda t, d: received.append((t, d)))
+        manager.subscribe("c", "s", ["SH"])
+        self.assertEqual(received, [("SH", {"A": {"v": 1}})])
+        source.fail = True
+        with self.assertRaises(RuntimeError):
+            manager.subscribe("c", "bad", ["SZ"])
+        self.assertNotIn("SZ", manager._combos)
+        self.assertNotIn(("c", "bad"), manager._sub_index)
+
+    def test_old_callback_cannot_route_through_new_subscription_of_same_topic(self):
+        source = FakeQuoteSource()
+        received = []
+        manager = QuoteSubscriptionManager(source, on_push_publisher=lambda t, d: received.append(d))
+        manager.subscribe("c", "first", ["SH"])
+        old_callback = source.subscriptions[1]["on_push"]
+        manager.unsubscribe("c", "first")
+        manager.subscribe("c", "second", ["SH"])
+        old_callback({"A": {"v": 1}})
+        source.subscriptions[2]["on_push"]({"A": {"v": 2}})
+        self.assertEqual(received, [{"A": {"v": 2}}])
+
+
+class SourcePublisherFailureTest(unittest.TestCase):
+    def test_synchronous_publisher_failure_keeps_subscription_and_later_callbacks(self):
+        class SynchronousSource(QuoteSourceAdapter):
+            def subscribe(self, codes, callback):
+                self.callback = callback
+                callback({"A": {"v": 1}})
+                return 1
+            def unsubscribe(self, handle):
+                pass
+        calls = []
+        def publish(topic, data):
+            if data["A"]["v"] == 1:
+                raise OSError("publisher unavailable")
+            calls.append(data)
+        source = SynchronousSource()
+        manager = QuoteSubscriptionManager(source, on_push_publisher=publish)
+        manager.subscribe("c", "s", ["SH"])
+        self.assertEqual(manager._combos["SH"].handle, 1)
+        source.callback({"A": {"v": 2}})
+        self.assertEqual(calls, [{"A": {"v": 2}}])
+        self.assertEqual(manager._quote_diagnostics.counts["publisher_failed"], 1)
